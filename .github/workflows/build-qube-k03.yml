@@ -41,6 +41,10 @@ jobs:
           cp -v rmk-qube/qube_display.rs rmk-src/keyboards/classic_qube/src/qube_display.rs
           cp -v rmk-qube/layer_names.rs rmk-src/keyboards/common/layer_names.rs
           cp -v rmk-qube/vial.json rmk-src/keyboards/k03/vial.json
+          # Fix for the Vial UNLOCK_POLL reply (Entropy hangs on unlock):
+          # `unlocking()` was re-armed unconditionally and the state was sampled
+          # before the key check, so "unlocked && !in_progress" never appeared.
+          cp -v rmk-qube/vial.rs rmk-src/rmk/src/host/via/vial.rs
 
       - name: Install ARM toolchain
         run: |
