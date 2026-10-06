@@ -141,9 +141,10 @@ impl<D> OriginDimensions for Scaled2<'_, D>
 where
     D: DrawTarget<Color = Rgb565>,
 {
+    /// Half of the panel frame: the wrapper always covers the whole screen at
+    /// half scale, so the concrete target does not have to report its size.
     fn size(&self) -> Size {
-        let size = self.inner.size();
-        Size::new(size.width / 2, size.height / 2)
+        Size::new(SCREEN_W as u32 / 2, SCREEN_H as u32 / 2)
     }
 }
 
