@@ -56,6 +56,12 @@
                     "width": 1
                 },
                 {
+                    "type": "select",
+                    "title": "Connection badge place",
+                    "qsid": 227,
+                    "variants": ["Header", "Chip row"]
+                },
+                {
                     "type": "integer",
                     "title": "Display brightness",
                     "qsid": 318,
