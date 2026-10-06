@@ -88,6 +88,8 @@ const SAFE_W: u32 = SCREEN_W as u32 - (SAFE_X as u32 * 2);
 const MEDIA_GAP_CHARS: usize = 3;
 /// Badge text buffer: `USB` / `BTn` / `BTn*` / `BTn~` / `---`.
 const OUTPUT_BADGE_CHARS: usize = 4;
+/// Media ticker: one character every 300 ms, three blanks between passes.
+const MEDIA_MARQUEE_STEP_MS: u64 = 300;
 /// Sixth chip slot of the modifier row (connection badge when placed here).
 const BADGE_CHIP_X: i32 = 216;
 const BADGE_CHIP_W: u32 = 38;
@@ -1634,6 +1636,9 @@ impl QubeStatusRenderer {
 
         let mut media: heapless::String<CONCEPT_MEDIA_MAX> = heapless::String::new();
         push_media_label(&mut media, &self.host_data);
+        // Phase of the media ticker: the concept bars scroll with the same
+        // 300 ms step as the dashboard header.
+        let media_offset = media_marquee_offset(media.len());
 
         let mut history = [0u8; WPM_HISTORY_LEN];
         self.wpm_history_ordered(&mut history);
@@ -1684,6 +1689,7 @@ impl QubeStatusRenderer {
             // (`rmk::host_data::HostData`), so there is no date to show.
             date: None,
             media,
+            media_offset,
             sleeping: ctx.sleeping,
             wpm_history: history,
             show_wpm: settings.wpm_visible,
@@ -1717,6 +1723,12 @@ impl QubeStatusRenderer {
         }
         let mut media: heapless::String<72> = heapless::String::new();
         push_media_label(&mut media, &self.host_data);
+        // Concept screens draw the ticker themselves; only `speedo` scrolls it,
+        // and with a wider window than the dashboard header.
+        if self.settings.concept.min(SCREEN_CONCEPT_MAX) != SCREEN_CONCEPT_DASHBOARD {
+            return self.settings.concept.min(SCREEN_CONCEPT_MAX) == SCREEN_CONCEPT_SPEEDO
+                && media.chars().count() > SPEEDO_MEDIA_CHARS;
+        }
         media.len() > self.geometry().media_limit
     }
 
@@ -2341,10 +2353,7 @@ fn draw_media_or_fallback<D: DrawTarget<Color = Rgb565>>(
     if media.chars().count() <= visible_chars {
         let _ = visible.push_str(&media);
     } else {
-        let elapsed = Instant::now()
-            .duration_since(Instant::from_ticks(0))
-            .as_millis() as usize;
-        let offset = (elapsed / 300) % (media.len() + MEDIA_GAP_CHARS);
+        let offset = media_marquee_offset(media.len());
         push_marquee_slice(&mut visible, &media, offset, visible_chars);
     }
 
@@ -2377,8 +2386,17 @@ fn push_ascii_text<const N: usize>(buffer: &mut heapless::String<N>, value: &str
     }
 }
 
-fn push_marquee_slice(
-    buffer: &mut heapless::String<32>,
+/// Current offset of the media ticker, in characters. Both the dashboard header
+/// and the concept bars use this, so the step never differs between screens.
+fn media_marquee_offset(len: usize) -> usize {
+    let elapsed = Instant::now()
+        .duration_since(Instant::from_ticks(0))
+        .as_millis() as usize;
+    (elapsed / MEDIA_MARQUEE_STEP_MS as usize) % (len + MEDIA_GAP_CHARS)
+}
+
+fn push_marquee_slice<const N: usize>(
+    buffer: &mut heapless::String<N>,
     text: &str,
     offset: usize,
     visible_chars: usize,
@@ -2468,6 +2486,8 @@ struct ConceptState {
     /// Host date; `None` while the RMK host protocol carries no date.
     date: Option<&'static str>,
     media: heapless::String<CONCEPT_MEDIA_MAX>,
+    /// Phase of the media ticker in characters (see [`media_marquee_offset`]).
+    media_offset: usize,
     sleeping: bool,
     /// Oldest-first WPM history, [`WPM_HISTORY_LEN`] samples.
     wpm_history: [u8; WPM_HISTORY_LEN],
@@ -2927,23 +2947,170 @@ fn render_concept_tiles<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptSt
     }
 }
 
-/// 5. Speedometer: the WPM number is the hero, with a segmented scale.
+// Layout of the speedometer: three columns with the media ticker under them.
+//
+//   LINK                 120                 LEFT
+//   [ USB ]     words per minute              73%      <- the value is
+//   wired        [20-segment 0..150]         RIGHT        FONT_10X20 ×2,
+//                                              41%        `%` included
+//   ──────────────────────────────────────────────────────
+//   Boards of Canada - Roygbiv (Live at Coachella 2006)…
+//
+// The ×2 value is wide: a full "100%" is 80 px, so the right column needs all of
+// its 82 px and the segmented scale stops at x = 180 instead of running under
+// the battery block (that would collide with the second row).
+
+const SPEEDO_LEFT: i32 = 16;
+const SPEEDO_RIGHT: i32 = 264;
+const SPEEDO_CENTRE: i32 = 140;
+const SPEEDO_TITLE_Y: i32 = 12;
+const SPEEDO_RULE_Y: i32 = 34;
+const SPEEDO_LINK_CAPTION_Y: i32 = 46;
+const SPEEDO_LINK_BADGE_Y: i32 = 62;
+const SPEEDO_LINK_STATE_Y: i32 = 88;
+const SPEEDO_WPM_Y: i32 = 52;
+const SPEEDO_WPM_CAPTION_Y: i32 = 98;
+const SPEEDO_SCALE_X: i32 = 40;
+const SPEEDO_SCALE_W: u32 = 140;
+const SPEEDO_SCALE_Y: i32 = 118;
+const SPEEDO_SCALE_H: u32 = 12;
+const SPEEDO_SCALE_LABEL_Y: i32 = 134;
+const SPEEDO_SCALE_MAX: u32 = 150;
+const SPEEDO_BAT_LABEL_Y: [i32; 2] = [44, 104];
+const SPEEDO_BAT_VALUE_Y: [i32; 2] = [56, 116];
+const SPEEDO_MEDIA_RULE_Y: i32 = 190;
+const SPEEDO_MEDIA_Y: i32 = 198;
+/// Ticker window in characters of `FONT_6X10` (280 − 2×20 = 240 px).
+const SPEEDO_MEDIA_CHARS: usize = 40;
+
+/// State word of the link column; the colour still comes from the badge.
+fn speedo_link_state(link: OutputState) -> &'static str {
+    match link {
+        OutputState::Usb => "wired",
+        OutputState::Ble { .. } => "connected",
+        OutputState::Pairing { .. } => "pairing",
+        OutputState::Reconnecting { .. } => "reconnecting",
+        OutputState::Idle => "idle",
+    }
+}
+
+/// Left column: connection type, its state and the badge, in the same colours
+/// the other screens use (`QSID 227 = Chip row` keeps the badge compact).
+fn speedo_link<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptState) {
+    ctext6(d, "LINK", SPEEDO_LEFT, SPEEDO_LINK_CAPTION_Y, C_DIM);
+    let (_, color) = st.badge();
+    badge_plate(d, SPEEDO_LEFT, SPEEDO_LINK_BADGE_Y, 44, 20, st);
+    ctext6(
+        d,
+        speedo_link_state(st.link),
+        SPEEDO_LEFT,
+        SPEEDO_LINK_STATE_Y,
+        color,
+    );
+}
+
+/// Right column, one half per row: compact label above the value, and the value
+/// in the largest font the panel has — `FONT_10X20` at ×2, `%` included.
+fn speedo_battery<D: DrawTarget<Color = Rgb565>>(d: &mut D, index: usize, st: &ConceptState) {
+    let slot = index.min(1);
+    let (level, connected) = st.bat(slot);
+    ctext6r(d, st.label(slot), SPEEDO_RIGHT, SPEEDO_BAT_LABEL_Y[slot], C_DIM);
+    let color = if connected { battery_color(level) } else { C_DIM };
+    let mut value: heapless::String<8> = heapless::String::new();
+    if !connected {
+        let _ = value.push_str("--");
+    } else if let Some(pct) = level {
+        let _ = write!(&mut value, "{}%", pct);
+    } else {
+        let _ = value.push_str("??");
+    }
+    ctext20(
+        d,
+        &value,
+        SPEEDO_RIGHT,
+        SPEEDO_BAT_VALUE_Y[slot],
+        color,
+        Alignment::Right,
+        2,
+    );
+}
+
+/// Bottom line: the media ticker (same window and step as the dashboard header),
+/// or the time when there is nothing to scroll — an empty strip would be dead
+/// space, and with no clock either the strip is not drawn at all.
+fn speedo_bottom<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptState) {
+    if st.show_media && !st.media.is_empty() {
+        cline(d, 20, SPEEDO_MEDIA_RULE_Y, 240, C_BORDER);
+        let mut line: heapless::String<48> = heapless::String::new();
+        if st.media.chars().count() <= SPEEDO_MEDIA_CHARS {
+            // A track that fits sits still and centred; only longer ones scroll.
+            let _ = line.push_str(st.media.as_str());
+            ctext6c(d, &line, SPEEDO_CENTRE, SPEEDO_MEDIA_Y, C_INK);
+        } else {
+            push_marquee_slice(
+                &mut line,
+                st.media.as_str(),
+                st.media_offset,
+                SPEEDO_MEDIA_CHARS,
+            );
+            ctext6(d, &line, 20, SPEEDO_MEDIA_Y, C_INK);
+        }
+        return;
+    }
+    if !st.show_clock {
+        return;
+    }
+    cline(d, 20, SPEEDO_MEDIA_RULE_Y, 240, C_BORDER);
+    ctext8(d, &st.time(), 20, SPEEDO_MEDIA_Y - 2, C_DIM);
+    let mut layer_no: heapless::String<8> = heapless::String::new();
+    let _ = write!(&mut layer_no, "L{}", st.layer);
+    ctext6r(d, &layer_no, 260, SPEEDO_MEDIA_Y + 2, C_DIM);
+}
+
+/// 5. Speedometer: link on the left, the WPM number (and its scale) in the
+/// centre, the battery percentages in the largest font on the right and the
+/// media ticker across the bottom.
 fn render_concept_speedo<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptState) {
     let _ = d.clear(C_BG);
+
     let (name, scale) = fit_name(st.name.as_str(), 200);
-    ctext20(d, &name, 140, 12, C_DIM, Alignment::Center, scale.min(1));
-    cline(d, 20, 34, 240, C_BORDER);
+    ctext20(
+        d,
+        &name,
+        SPEEDO_CENTRE,
+        SPEEDO_TITLE_Y,
+        C_DIM,
+        Alignment::Center,
+        scale.min(1),
+    );
+    cline(d, 20, SPEEDO_RULE_Y, 240, C_BORDER);
 
     if st.show_wpm {
         let mut wpm: heapless::String<8> = heapless::String::new();
         let _ = write!(&mut wpm, "{}", st.wpm);
-        ctext20(d, &wpm, 140, 58, C_ACCENT, Alignment::Center, 2);
-        ctext6c(d, "words per minute", 140, 122, C_DIM);
+        ctext20(
+            d,
+            &wpm,
+            SPEEDO_CENTRE,
+            SPEEDO_WPM_Y,
+            C_ACCENT,
+            Alignment::Center,
+            2,
+        );
+        ctext6c(
+            d,
+            "words per minute",
+            SPEEDO_CENTRE,
+            SPEEDO_WPM_CAPTION_Y,
+            C_DIM,
+        );
 
         const SEGMENTS: u32 = 20;
-        let filled = (st.wpm.min(150) as u32 * SEGMENTS / 150).min(SEGMENTS);
+        let filled =
+            (st.wpm.min(SPEEDO_SCALE_MAX as u16) as u32 * SEGMENTS / SPEEDO_SCALE_MAX).min(SEGMENTS);
+        let pitch = SPEEDO_SCALE_W / SEGMENTS;
         for segment in 0..SEGMENTS {
-            let x = 20 + segment as i32 * 12;
+            let x = SPEEDO_SCALE_X + segment as i32 * pitch as i32;
             let color = if segment < filled {
                 if segment * 100 / SEGMENTS < 60 {
                     C_OK
@@ -2955,18 +3122,35 @@ fn render_concept_speedo<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptS
             } else {
                 C_PANEL_HI
             };
-            cfill(d, x, 146, 10, 12, color);
+            cfill(
+                d,
+                x,
+                SPEEDO_SCALE_Y,
+                pitch.saturating_sub(1),
+                SPEEDO_SCALE_H,
+                color,
+            );
         }
-        ctext6(d, "0", 20, 162, C_DIM);
-        ctext6r(d, "150", 260, 162, C_DIM);
+        ctext6(d, "0", SPEEDO_SCALE_X, SPEEDO_SCALE_LABEL_Y, C_DIM);
+        ctext6r(
+            d,
+            "150",
+            SPEEDO_SCALE_X + SPEEDO_SCALE_W as i32,
+            SPEEDO_SCALE_LABEL_Y,
+            C_DIM,
+        );
     }
 
     if st.show_output {
-        badge_line(d, 24, 196, st);
+        speedo_link(d, st);
     }
     if st.show_batteries {
-        bat_line(d, 152, 196, st);
+        for index in 0..2 {
+            speedo_battery(d, index, st);
+        }
     }
+
+    speedo_bottom(d, st);
 }
 
 /// 6. Info centre: big clock, date, media ticker, one status line.
