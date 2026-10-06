@@ -115,62 +115,139 @@ const FIRMWARE_VERSION: &str = match option_env!("RMK_FIRMWARE_VERSION") {
 };
 
 
-/// Wordmark anchor in half-scale (x2 text) coordinates: screen (140, 104).
-const SPLASH_WORD_CENTER: Point = Point::new(70, 52);
-/// Layer-name anchor in half-scale coordinates: screen (140, 74).
-const LAYER_NAME_CENTER: Point = Point::new(70, 37);
-/// Right/top corner of the WPM value in half-scale coordinates: screen (248, 112).
-const WPM_VALUE_RIGHT_TOP: Point = Point::new(124, 56);
+/// Wordmark anchor in *screen* coordinates: top edge, horizontally centred.
+const SPLASH_WORD_TOP: Point = Point::new(SCREEN_W as i32 / 2, 84);
+/// Layer-name anchor in screen coordinates: top edge, horizontally centred.
+const LAYER_NAME_TOP: Point = Point::new(SCREEN_W as i32 / 2, 54);
+/// WPM value anchor in screen coordinates: right edge, top edge.
+const WPM_VALUE_RIGHT_TOP: Point = Point::new(248, 112);
 
 
 // --- x2 text scaling --------------------------------------------------------
 
 
-/// DrawTarget wrapper where one pixel becomes a 2x2 block.
+/// Scratch target that rasterises text at 1x into a tiny fixed buffer.
 ///
-/// Only `draw_iter` is overridden — every other `DrawTarget` method funnels
-/// through it, so glyphs and shapes scale consistently. Coordinates passed
-/// through this wrapper are half-scale: `Point::new(70, 37)` lands on screen at
-/// (140, 74).
-struct Scaled2<'a, D> {
-    inner: &'a mut D,
+/// The buffer is a plain `DrawTarget` of its own: text rendering therefore
+/// never re-enters the panel target with synthesised shapes, and the later
+/// blit writes enlarged pixels through `draw_iter` on the panel target, in
+/// *screen* coordinates — exactly the path the stock renderer already uses.
+const GLYPH_BUF_W: u32 = 12;
+const GLYPH_BUF_H: u32 = 22;
+const GLYPH_BUF_LEN: usize = (GLYPH_BUF_W * GLYPH_BUF_H) as usize;
+
+struct GlyphBuf {
+    pixels: [bool; GLYPH_BUF_LEN],
 }
 
+impl GlyphBuf {
+    fn new() -> Self {
+        Self {
+            pixels: [false; GLYPH_BUF_LEN],
+        }
+    }
 
-impl<D> OriginDimensions for Scaled2<'_, D>
-where
-    D: DrawTarget<Color = Rgb565>,
-{
-    /// Half of the panel frame: the wrapper always covers the whole screen at
-    /// half scale, so the concrete target does not have to report its size.
+    fn clear(&mut self) {
+        self.pixels = [false; GLYPH_BUF_LEN];
+    }
+
+    fn is_set(&self, x: i32, y: i32) -> bool {
+        if x < 0 || y < 0 {
+            return false;
+        }
+        let (x, y) = (x as u32, y as u32);
+        if x >= GLYPH_BUF_W || y >= GLYPH_BUF_H {
+            return false;
+        }
+        let index = (y * GLYPH_BUF_W + x) as usize;
+        index < GLYPH_BUF_LEN && self.pixels[index]
+    }
+}
+
+impl OriginDimensions for GlyphBuf {
     fn size(&self) -> Size {
-        Size::new(SCREEN_W as u32 / 2, SCREEN_H as u32 / 2)
+        Size::new(GLYPH_BUF_W, GLYPH_BUF_H)
+    }
+}
+
+impl DrawTarget for GlyphBuf {
+    type Color = Rgb565;
+    type Error = core::convert::Infallible;
+
+    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
+    where
+        I: IntoIterator<Item = Pixel<Rgb565>>,
+    {
+        for Pixel(point, _) in pixels {
+            if point.x < 0 || point.y < 0 {
+                continue;
+            }
+            let (x, y) = (point.x as u32, point.y as u32);
+            if x >= GLYPH_BUF_W || y >= GLYPH_BUF_H {
+                continue;
+            }
+            let index = (y * GLYPH_BUF_W + x) as usize;
+            if index < GLYPH_BUF_LEN {
+                self.pixels[index] = true;
+            }
+        }
+        Ok(())
     }
 }
 
 
-impl<D> DrawTarget for Scaled2<'_, D>
-where
+/// Draws `text` at double size: each glyph is rasterised at 1x into `GlyphBuf`
+/// and then blitted as 2x2 blocks of `color`.
+///
+/// `anchor` is in screen coordinates: `y` is the top edge of the text box and
+/// `x` is the left edge, centre or right edge depending on `align`.
+fn draw_text_x2<D>(
+    display: &mut D,
+    text: &str,
+    anchor: Point,
+    style: MonoTextStyle<'_, Rgb565>,
+    align: Alignment,
+) where
     D: DrawTarget<Color = Rgb565>,
 {
-    type Color = Rgb565;
-    type Error = D::Error;
+    let top_left = TextStyleBuilder::new().baseline(Baseline::Top).build();
+    let advance = (style.font.character_size.width + style.font.character_spacing) as i32;
+    let spacing = style.font.character_spacing as i32;
+    let glyphs = text.chars().count() as i32;
+    let width = (glyphs * advance - spacing).max(0) * 2;
 
+    let mut pen_x = match align {
+        Alignment::Left => anchor.x,
+        Alignment::Center => anchor.x - width / 2,
+        Alignment::Right => anchor.x - width,
+    };
 
-    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
-    where
-        I: IntoIterator<Item = embedded_graphics::Pixel<Rgb565>>,
-    {
-        for pixel in pixels {
-            let point = pixel.0;
-            let color = pixel.1;
-            let block = Rectangle::new(
-                Point::new(point.x * 2, point.y * 2),
-                Size::new(2, 2),
-            );
-            self.inner.fill_solid(&block, color)?;
+    let mut buffer = GlyphBuf::new();
+    let mut single: heapless::String<8> = heapless::String::new();
+    for ch in text.chars() {
+        buffer.clear();
+        single.clear();
+        let _ = single.push(ch);
+        let _ = Text::with_text_style(&single, Point::zero(), style, top_left).draw(&mut buffer);
+
+        for y in 0..GLYPH_BUF_H as i32 {
+            for x in 0..GLYPH_BUF_W as i32 {
+                if !buffer.is_set(x, y) {
+                    continue;
+                }
+                let sx = pen_x + x * 2;
+                let sy = anchor.y + y * 2;
+                if let Some(color) = style.text_color {
+                    let _ = display.draw_iter([
+                        Pixel(Point::new(sx, sy), color),
+                        Pixel(Point::new(sx + 1, sy), color),
+                        Pixel(Point::new(sx, sy + 1), color),
+                        Pixel(Point::new(sx + 1, sy + 1), color),
+                    ]);
+                }
+            }
         }
-        Ok(())
+        pen_x += advance * 2;
     }
 }
 
@@ -853,8 +930,12 @@ where
                 need_redraw = false;
             }
             UiEv::Wpm(e) => {
-                self.ctx.wpm = e.0;
-                self.request_redraw_region(WPM_DIRTY);
+                // Only repaint when the number really changed: RMK may publish
+                // repeated WPM updates and each band repaint costs two stripes.
+                if self.ctx.wpm != e.0 {
+                    self.ctx.wpm = e.0;
+                    self.request_redraw_region(WPM_DIRTY);
+                }
                 need_redraw = false;
             }
             UiEv::Led(e) => {
@@ -1009,18 +1090,11 @@ impl DisplayRenderer<Rgb565> for QubeStatusRenderer {
         let header_media = MonoTextStyle::new(&FONT_6X10, COL_FG);
         let header_fallback = MonoTextStyle::new(&FONT_8X13, COL_ACCENT);
         let body = MonoTextStyle::new(&FONT_8X13, COL_FG);
-        let title_shadow = MonoTextStyle::new(&FONT_10X20, COL_ACCENT_DIM);
-        let title = MonoTextStyle::new(&FONT_10X20, COL_FG);
-        let wpm_value = MonoTextStyle::new(&FONT_10X20, COL_ACCENT);
         let wpm_label = MonoTextStyle::new(&FONT_6X10, COL_MUTED);
         let top_left = TextStyleBuilder::new().baseline(Baseline::Top).build();
         let tr = TextStyleBuilder::new()
             .alignment(Alignment::Right)
             .baseline(Baseline::Top)
-            .build();
-        let mc = TextStyleBuilder::new()
-            .alignment(Alignment::Center)
-            .baseline(Baseline::Middle)
             .build();
         let left = ctx.peripherals_connected.first().copied().unwrap_or(false);
         let right = ctx.peripherals_connected.get(1).copied().unwrap_or(false);
@@ -1057,16 +1131,21 @@ impl DisplayRenderer<Rgb565> for QubeStatusRenderer {
         let _ = write!(&mut s, "L{}", ctx.layer);
         let _ = Text::with_text_style(&s, Point::new(SAFE_X + 12, 50), layer_meta, top_left)
             .draw(display);
-        {
-            let mut big = Scaled2 { inner: &mut *display };
-            let _ = Text::with_text_style(
+        if !name.is_empty() {
+            draw_text_x2(
+                display,
                 name,
-                Point::new(LAYER_NAME_CENTER.x + 1, LAYER_NAME_CENTER.y + 1),
-                title_shadow,
-                mc,
-            )
-            .draw(&mut big);
-            let _ = Text::with_text_style(name, LAYER_NAME_CENTER, title, mc).draw(&mut big);
+                Point::new(LAYER_NAME_TOP.x + 1, LAYER_NAME_TOP.y + 1),
+                MonoTextStyle::new(&FONT_10X20, COL_ACCENT_DIM),
+                Alignment::Center,
+            );
+            draw_text_x2(
+                display,
+                name,
+                LAYER_NAME_TOP,
+                MonoTextStyle::new(&FONT_10X20, COL_FG),
+                Alignment::Center,
+            );
         }
 
         // WPM panel (x2 value).
@@ -1077,10 +1156,13 @@ impl DisplayRenderer<Rgb565> for QubeStatusRenderer {
             .draw(display);
         s.clear();
         let _ = write!(&mut s, "{}", ctx.wpm);
-        {
-            let mut big = Scaled2 { inner: &mut *display };
-            let _ = Text::with_text_style(&s, WPM_VALUE_RIGHT_TOP, wpm_value, tr).draw(&mut big);
-        }
+        draw_text_x2(
+            display,
+            &s,
+            WPM_VALUE_RIGHT_TOP,
+            MonoTextStyle::new(&FONT_10X20, COL_ACCENT),
+            Alignment::Right,
+        );
 
         // Modifier chips.
         self.render_modifiers(ctx, display);
@@ -1093,10 +1175,6 @@ impl DisplayRenderer<Rgb565> for QubeStatusRenderer {
 
 /// Boot splash: accent bars, x2 wordmark and the firmware version.
 fn render_splash<D: DrawTarget<Color = Rgb565>>(display: &mut D) {
-    let middle = TextStyleBuilder::new()
-        .alignment(Alignment::Center)
-        .baseline(Baseline::Middle)
-        .build();
     let top = TextStyleBuilder::new()
         .alignment(Alignment::Center)
         .baseline(Baseline::Top)
@@ -1105,19 +1183,20 @@ fn render_splash<D: DrawTarget<Color = Rgb565>>(display: &mut D) {
 
 
     draw_round_fill(display, 96, 72, 88, 3, 1, COL_ACCENT);
-    {
-        let mut big = Scaled2 { inner: &mut *display };
-        let word = MonoTextStyle::new(&FONT_10X20, COL_FG);
-        let word_shadow = MonoTextStyle::new(&FONT_10X20, COL_ACCENT_DIM);
-        let _ = Text::with_text_style(
-            "QUBE",
-            Point::new(SPLASH_WORD_CENTER.x + 1, SPLASH_WORD_CENTER.y + 1),
-            word_shadow,
-            middle,
-        )
-        .draw(&mut big);
-        let _ = Text::with_text_style("QUBE", SPLASH_WORD_CENTER, word, middle).draw(&mut big);
-    }
+    draw_text_x2(
+        display,
+        "QUBE",
+        Point::new(SPLASH_WORD_TOP.x + 1, SPLASH_WORD_TOP.y + 1),
+        MonoTextStyle::new(&FONT_10X20, COL_ACCENT_DIM),
+        Alignment::Center,
+    );
+    draw_text_x2(
+        display,
+        "QUBE",
+        SPLASH_WORD_TOP,
+        MonoTextStyle::new(&FONT_10X20, COL_FG),
+        Alignment::Center,
+    );
     draw_round_fill(display, 60, 140, 160, 2, 1, COL_ACCENT_DIM);
 
 
