@@ -39,6 +39,8 @@ jobs:
         run: |
           cp -v rmk-qube/keyboard_k03.toml rmk-src/keyboards/classic_qube/keyboard_k03.toml
           cp -v rmk-qube/qube_display.rs rmk-src/keyboards/classic_qube/src/qube_display.rs
+          cp -v rmk-qube/layer_names.rs rmk-src/keyboards/common/layer_names.rs
+          cp -v rmk-qube/vial.json rmk-src/keyboards/k03/vial.json
 
       - name: Install ARM toolchain
         run: |
@@ -48,6 +50,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
+          # Pinned on purpose: firmware built with 1.99.0 does not boot on the
+          # dongle, 1.98.0 (same as the official v0.1.8 release) does.
+          toolchain: 1.98.0
           targets: thumbv7em-none-eabihf
 
       - name: Cache cargo registry

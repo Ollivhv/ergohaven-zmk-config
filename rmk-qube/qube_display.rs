@@ -8,6 +8,13 @@
 //! - Physical FB: 280×48×2 ≈ 27 KiB (< EasyDMA MAXCNT 65535, RAM-safe)
 //! - Each redraw: for each stripe → clip-draw full UI → SPI that stripe
 //!
+//! Every zone, colour and the connection indicator are driven by the runtime
+//! settings stored in `crate::layer_names` (Vial device settings, QSID
+//! 216..=226 / 318 / 320..=322 / 330..=332). The palette, the software
+//! brightness and the idle blanking are applied to the finished stripe, so the
+//! UI code always draws with the original constants and a device that never
+//! stored settings renders exactly the pre-settings frame.
+//!
 //! Pinout (`qube.overlay`):
 //! SPI3 SCK=P1.11 MOSI=P1.10 · CS=P1.13 · DC=P0.28 · RST=P0.03 · BL=P0.02
 
@@ -36,13 +43,22 @@ use lcd_async::{Builder, Display as LcdDisplay};
 use rmk::core_traits::Runnable;
 use rmk::display::{DisplayRenderer, RenderContext};
 use rmk::event::{
-    BatteryStatusEvent, CentralConnectedEvent, ConnectionStatusChangeEvent, EventSubscriber,
-    KeyboardEvent, LayerChangeEvent, LedIndicatorEvent, ModifierEvent, PeripheralBatteryEvent,
-    PeripheralConnectedEvent, SleepStateEvent, SubscribableEvent, WpmUpdateEvent,
+    BatteryStatusEvent, BleAdvertisingMode, BleAdvertisingModeEvent, CentralConnectedEvent,
+    ConnectionStatusChangeEvent, EventSubscriber, KeyboardEvent, LayerChangeEvent,
+    LedIndicatorEvent, ModifierEvent, PeripheralBatteryEvent, PeripheralConnectedEvent,
+    SleepStateEvent, SubscribableEvent, WpmUpdateEvent,
 };
 use rmk::processor::Processor;
 use rmk_types::battery::BatteryStatus;
+use rmk_types::ble::BleState;
+use rmk_types::connection::{ConnectionStatus, ConnectionType};
 use static_cell::StaticCell;
+
+use crate::layer_names::{
+    self, ScreenSettings, BATTERY_LABEL_MAX, DEFAULT_ACCENT, DEFAULT_ACCENT_DIM,
+    DEFAULT_BACKGROUND, SCREEN_BRIGHTNESS_MAX, SCREEN_HEADER_CLOCK, SCREEN_HEADER_MEDIA,
+    SCREEN_OUTPUT_CHIP, SCREEN_OUTPUT_HEADER,
+};
 
 // --- Panel geometry ---------------------------------------------------------
 
@@ -61,20 +77,202 @@ const STRIPE_BYTES: usize = SCREEN_W * STRIPE_H * 2;
 const BACKLIGHT_ACTIVE_HIGH: bool = true;
 const SAFE_X: i32 = 18;
 const SAFE_W: u32 = SCREEN_W as u32 - (SAFE_X as u32 * 2);
-const MEDIA_VISIBLE_CHARS: usize = 26;
 const MEDIA_GAP_CHARS: usize = 3;
+/// Badge text buffer: `USB` / `BTn` / `BTn*` / `BTn~` / `---`.
+const OUTPUT_BADGE_CHARS: usize = 4;
+/// Sixth chip slot of the modifier row (connection badge when placed here).
+const BADGE_CHIP_X: i32 = 216;
+const BADGE_CHIP_W: u32 = 38;
 const PANEL_RADIUS: u32 = 14;
 const CHIP_RADIUS: u32 = 7;
 const BAR_RADIUS: u32 = 5;
 
-// Keep status-only redraws away from the split/USB critical path. A complete
-// 280x240 RGB565 transfer at 8 MHz takes over 130 ms before render overhead;
-// these bands match the fixed vertical zones rendered below.
+// Layout v2: the layer name and the WPM block share one row, the connection
+// badge sits either in the header or in a sixth chip slot, and every band —
+// including the dirty regions — comes from `compute_layout`/`geometry`, so a
+// hidden zone hands its height to the row.
+
+/// Geometry of one vertical zone: top edge plus height.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Band {
+    y: i32,
+    h: u32,
+}
+
+impl Band {
+    const fn bottom(&self) -> i32 {
+        self.y + self.h as i32
+    }
+}
+
+/// Zone stack of the dashboard. Identical to the host stand's
+/// `compute_layout_v2`, which is what makes the PNG previews comparable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Layout {
+    header: Band,
+    /// One row: layer name on the left, compact WPM block on the right.
+    row: Band,
+    modifiers: Option<Band>,
+    batteries: Option<Band>,
+}
+
+const LAYOUT_TOP: i32 = 14;
+const LAYOUT_BOTTOM_MARGIN: i32 = 12;
+const LAYOUT_HEADER_H: u32 = 28;
+const LAYOUT_ROW_MIN_H: u32 = 54;
+const LAYOUT_MODS_H: u32 = 16;
+const LAYOUT_BAT_H: u32 = 40;
+const LAYOUT_GAP_HEADER: i32 = 4;
+const LAYOUT_GAP: i32 = 6;
+
+fn compute_layout(settings: &ScreenSettings) -> Layout {
+    let mut reserve = 0i32;
+    if settings.show_modifiers {
+        reserve += LAYOUT_GAP + LAYOUT_MODS_H as i32;
+    }
+    if settings.show_batteries {
+        reserve += LAYOUT_GAP + LAYOUT_BAT_H as i32;
+    }
+
+    let header = Band {
+        y: LAYOUT_TOP,
+        h: LAYOUT_HEADER_H,
+    };
+    let row_top = header.bottom() + LAYOUT_GAP_HEADER;
+    let row_h = ((SCREEN_H as i32 - LAYOUT_BOTTOM_MARGIN) - reserve - row_top)
+        .max(LAYOUT_ROW_MIN_H as i32);
+    let row = Band {
+        y: row_top,
+        h: row_h as u32,
+    };
+
+    let mut y = row.bottom();
+    let modifiers = if settings.show_modifiers {
+        y += LAYOUT_GAP;
+        let band = Band { y, h: LAYOUT_MODS_H };
+        y = band.bottom();
+        Some(band)
+    } else {
+        None
+    };
+    let batteries = if settings.show_batteries {
+        y += LAYOUT_GAP;
+        Some(Band {
+            y,
+            h: LAYOUT_BAT_H,
+        })
+    } else {
+        None
+    };
+
+    Layout {
+        header,
+        row,
+        modifiers,
+        batteries,
+    }
+}
+
+// Dirty regions, all cut from the same layout: fixed header band, the row, and
+// the two optional bands padded like the stand's report (4 px above, 2 below).
 const HEADER_DIRTY: DirtyRegion = DirtyRegion::range(12, 44);
-const LAYER_DIRTY: DirtyRegion = DirtyRegion::range(44, 102);
-const WPM_DIRTY: DirtyRegion = DirtyRegion::range(102, 162);
-const MODIFIER_DIRTY: DirtyRegion = DirtyRegion::range(162, 184);
-const BATTERY_DIRTY: DirtyRegion = DirtyRegion::range(184, 230);
+
+fn row_dirty(row: Band) -> DirtyRegion {
+    DirtyRegion::range(44, clamp_u16(row.bottom() + 2))
+}
+
+fn band_dirty(band: Band) -> DirtyRegion {
+    DirtyRegion::range(clamp_u16(band.y - 4), clamp_u16(band.bottom() + 2))
+}
+
+fn clamp_u16(value: i32) -> u16 {
+    if value <= 0 {
+        0
+    } else {
+        value.min(SCREEN_H as i32) as u16
+    }
+}
+
+/// Horizontal geometry of layout v2, derived from the font metrics exactly
+/// like the stand's `v2_geometry` (name starts at `SAFE_X+6`, 6 px padding on
+/// the right, badge slot `3 + 4 + 4` glyphs, clock 5 glyphs of `FONT_8X13`).
+#[allow(dead_code)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Geometry {
+    f6: i32,
+    f10: i32,
+    name_x: i32,
+    row_right: i32,
+    header_right: i32,
+    badge_w: i32,
+    badge_in_header: bool,
+    clock_right: i32,
+    media_x: i32,
+    media_limit: usize,
+    wpm_right: i32,
+    name_limit: i32,
+}
+
+fn font_advance(font: &embedded_graphics::mono_font::MonoFont<'_>) -> i32 {
+    (font.character_size.width + font.character_spacing) as i32
+}
+
+fn geometry(settings: &ScreenSettings) -> Geometry {
+    let f6 = font_advance(&FONT_6X10);
+    let f8 = font_advance(&FONT_8X13);
+    let f10 = font_advance(&FONT_10X20);
+
+    let name_x = SAFE_X + 6;
+    let row_right = SAFE_X + SAFE_W as i32 - 6;
+    let header_right = SAFE_X + SAFE_W as i32 - 12;
+    let badge_w = 3 + 4 + 4 * f6;
+    let badge_in_header =
+        settings.output_visible && settings.output_place == SCREEN_OUTPUT_HEADER;
+    let clock_right = if badge_in_header {
+        header_right - badge_w - 8
+    } else {
+        SAFE_X + SAFE_W as i32 - 14
+    };
+    let clock_w = 5 * f8;
+
+    let media_x = SAFE_X + 22;
+    let media_limit = {
+        let right = match settings.header_mode {
+            SCREEN_HEADER_CLOCK => media_x,
+            SCREEN_HEADER_MEDIA => {
+                if badge_in_header {
+                    header_right - badge_w - 6
+                } else {
+                    header_right
+                }
+            }
+            _ => clock_right - clock_w - 6,
+        };
+        (((right - media_x) / f6).max(0) as usize).min(layer_names::MEDIA_VISIBLE_CHARS)
+    };
+
+    let wpm_right = if settings.wpm_visible { row_right } else { 0 };
+    let name_limit = if settings.wpm_visible {
+        wpm_right - 3 * f6 - 8
+    } else {
+        row_right
+    };
+
+    Geometry {
+        f6,
+        f10,
+        name_x,
+        row_right,
+        header_right,
+        badge_w,
+        badge_in_header,
+        clock_right,
+        media_x,
+        media_limit,
+        wpm_right,
+        name_limit,
+    }
+}
 // Display state may be a few frames late, but cursor motion must never wait
 // behind framebuffer rendering or SPI. Apply pending UI changes once the
 // pointing stream has been quiet for this window.
@@ -100,6 +298,130 @@ const COL_PANEL_HI: Rgb565 = Rgb565::new(3, 9, 13);
 const COL_BORDER: Rgb565 = Rgb565::new(5, 13, 16);
 const COL_BORDER_DIM: Rgb565 = Rgb565::new(3, 8, 11);
 
+// --- Settings-driven look ---------------------------------------------------
+
+/// Raw RGB565 of the pre-settings palette entries. `DEFAULT_*` from
+/// `layer_names` are the 8-bit expansions of exactly these values, so the
+/// factory settings rebuild the original colours (checked at compile time).
+const COL_ACCENT_RAW: u16 = (3 << 11) | (38 << 5) | 31;
+const COL_ACCENT_DIM_RAW: u16 = (1 << 11) | (16 << 5) | 18;
+const COL_BG_RAW: u16 = (2 << 5) | 4;
+
+const fn rgb8_to_raw565(color: [u8; 3]) -> u16 {
+    (((color[0] >> 3) as u16) << 11)
+        | (((color[1] >> 2) as u16) << 5)
+        | ((color[2] >> 3) as u16)
+}
+
+const _: () = assert!(rgb8_to_raw565(DEFAULT_ACCENT) == COL_ACCENT_RAW);
+const _: () = assert!(rgb8_to_raw565(DEFAULT_ACCENT_DIM) == COL_ACCENT_DIM_RAW);
+const _: () = assert!(rgb8_to_raw565(DEFAULT_BACKGROUND) == COL_BG_RAW);
+
+fn rgb565_from_rgb8(color: [u8; 3]) -> Rgb565 {
+    Rgb565::new(color[0] >> 3, color[1] >> 2, color[2] >> 3)
+}
+
+/// Connection indicator colours: green = active transport, blue = searching or
+/// reconnecting, grey = the dongle is not talking to anything.
+const COL_OUTPUT_OK: Rgb565 = Rgb565::new(4, 46, 12);
+const COL_OUTPUT_SEARCH: Rgb565 = Rgb565::new(4, 24, 31);
+const COL_OUTPUT_IDLE: Rgb565 = COL_DIM;
+
+/// What the header indicator shows right now.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum OutputState {
+    /// USB carries the active link (configured or suspended for remote wakeup).
+    Usb,
+    /// Bluetooth profile `n` is connected.
+    Ble { profile: u8 },
+    /// Advertising for a new host (no bond for the active profile).
+    Pairing { profile: u8 },
+    /// Advertising to reconnect a bonded host (also used before the first
+    /// [`BleAdvertisingModeEvent`] arrives).
+    Reconnecting { profile: u8 },
+    /// Nothing is connected and nothing is being searched for.
+    Idle,
+}
+
+impl OutputState {
+    fn from_connection(
+        connection: &ConnectionStatus,
+        advertising: Option<BleAdvertisingMode>,
+    ) -> Self {
+        match connection.decide_active() {
+            Some(ConnectionType::Usb) => Self::Usb,
+            Some(ConnectionType::Ble) => Self::Ble {
+                profile: connection.ble.profile,
+            },
+            None => {
+                if matches!(connection.ble.state, BleState::Advertising) {
+                    let profile = connection.ble.profile;
+                    match advertising {
+                        Some(BleAdvertisingMode::Pairing) => Self::Pairing { profile },
+                        Some(BleAdvertisingMode::Reconnecting) => Self::Reconnecting { profile },
+                        None => Self::Reconnecting { profile },
+                    }
+                } else {
+                    Self::Idle
+                }
+            }
+        }
+    }
+
+    /// Badge text and colour: `USB` / `BT{n}` / `BT{n}*` (pairing) /
+    /// `BT{n}~` (reconnecting) / `---`, green for an active transport, blue
+    /// while searching, grey when nothing is in use.
+    fn badge(self) -> (heapless::String<OUTPUT_BADGE_CHARS>, Rgb565) {
+        let mut text: heapless::String<OUTPUT_BADGE_CHARS> = heapless::String::new();
+        let digit = |profile: u8| (b'0' + profile.min(9)) as char;
+        let color = match self {
+            Self::Usb => {
+                let _ = text.push_str("USB");
+                COL_OUTPUT_OK
+            }
+            Self::Ble { profile } => {
+                let _ = write!(&mut text, "BT{}", digit(profile));
+                COL_OUTPUT_OK
+            }
+            Self::Pairing { profile } => {
+                let _ = write!(&mut text, "BT{}*", digit(profile));
+                COL_OUTPUT_SEARCH
+            }
+            Self::Reconnecting { profile } => {
+                let _ = write!(&mut text, "BT{}~", digit(profile));
+                COL_OUTPUT_SEARCH
+            }
+            Self::Idle => {
+                let _ = text.push_str("---");
+                COL_OUTPUT_IDLE
+            }
+        };
+        (text, color)
+    }
+}
+
+/// Post-pass over a finished stripe: palette substitution, software brightness
+/// and the idle blank. Same maths the host stand applies to its PNGs.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Look {
+    accent: Rgb565,
+    accent_dim: Rgb565,
+    background: Rgb565,
+    brightness: u8,
+    blank: bool,
+}
+
+impl Look {
+    fn from_settings(settings: &ScreenSettings, blank: bool) -> Self {
+        Self {
+            accent: rgb565_from_rgb8(settings.accent),
+            accent_dim: rgb565_from_rgb8(settings.accent_dim),
+            background: rgb565_from_rgb8(settings.background),
+            brightness: settings.brightness.min(SCREEN_BRIGHTNESS_MAX),
+            blank,
+        }
+    }
+}
 
 // --- Boot splash ------------------------------------------------------------
 
@@ -117,10 +439,10 @@ const FIRMWARE_VERSION: &str = match option_env!("RMK_FIRMWARE_VERSION") {
 
 /// Wordmark anchor in *screen* coordinates: top edge, horizontally centred.
 const SPLASH_WORD_TOP: Point = Point::new(SCREEN_W as i32 / 2, 84);
-/// Layer-name anchor in screen coordinates: top edge, horizontally centred.
-const LAYER_NAME_TOP: Point = Point::new(SCREEN_W as i32 / 2, 54);
-/// WPM value anchor in screen coordinates: right edge, top edge.
-const WPM_VALUE_RIGHT_TOP: Point = Point::new(248, 112);
+/// WPM value anchor: right edge (the band height comes from the layout).
+/// Battery card geometry (two cards plus the gap fill `SAFE_W` exactly).
+const BATTERY_CARD_W: i32 = 116;
+const BATTERY_CARD_GAP: i32 = 12;
 
 
 // --- x2 text scaling --------------------------------------------------------
@@ -303,6 +625,44 @@ impl StripeLcd {
         }
     }
 
+    /// Rewrites the finished stripe in place: the three palette entries the UI
+    /// draws with are replaced by the configured colours, every component is
+    /// scaled by the brightness setting, and a blanked screen becomes black.
+    ///
+    /// Doing it here keeps every drawing helper on the original constants and
+    /// costs one pass over ≤ 26 880 bytes per stripe.
+    fn apply_look(&mut self, look: &Look) {
+        let bytes = SCREEN_W * self.band_h as usize * 2;
+        let accent = look.accent.into_storage();
+        let accent_dim = look.accent_dim.into_storage();
+        let background = look.background.into_storage();
+        let scale = look.brightness.min(SCREEN_BRIGHTNESS_MAX) as u32;
+        for pix in self.buffer[..bytes].chunks_exact_mut(2) {
+            if look.blank {
+                pix[0] = 0;
+                pix[1] = 0;
+                continue;
+            }
+            let mut raw = ((pix[0] as u16) << 8) | pix[1] as u16;
+            if raw == COL_ACCENT_RAW {
+                raw = accent;
+            } else if raw == COL_ACCENT_DIM_RAW {
+                raw = accent_dim;
+            } else if raw == COL_BG_RAW {
+                raw = background;
+            }
+            if scale < SCREEN_BRIGHTNESS_MAX as u32 {
+                let r5 = ((raw >> 11) & 0x1F) as u32 * scale / 100;
+                let g6 = ((raw >> 5) & 0x3F) as u32 * scale / 100;
+                let b5 = (raw & 0x1F) as u32 * scale / 100;
+                raw = ((r5 as u16) << 11) | ((g6 as u16) << 5) | b5 as u16;
+            }
+            let out = raw.to_be_bytes();
+            pix[0] = out[0];
+            pix[1] = out[1];
+        }
+    }
+
     fn put_pixel(&mut self, x: i32, y: i32, color: Rgb565) {
         if x < 0 || y < 0 {
             return;
@@ -328,7 +688,8 @@ impl StripeLcd {
         self.buffer[off + 1] = c[1];
     }
 
-    async fn flush_band(&mut self) {
+    async fn flush_band(&mut self, look: &Look) {
+        self.apply_look(look);
         let w = SCREEN_W as u16;
         let h = self.band_h;
         let y = self.band_y;
@@ -447,7 +808,13 @@ where
     }
 
     /// Redraw the requested vertical region via stripe multipass.
-    async fn present_dirty(&mut self, renderer: &mut QubeStatusRenderer, ctx: &RenderContext, dirty: DirtyRegion) {
+    async fn present_dirty(
+        &mut self,
+        renderer: &mut QubeStatusRenderer,
+        ctx: &RenderContext,
+        dirty: DirtyRegion,
+        look: &Look,
+    ) {
         self.ensure_init().await;
         let LcdState::Active(lcd) = &mut self.state else {
             return;
@@ -466,25 +833,28 @@ where
             lcd.clear_stripe(COL_BG);
             // Re-run full UI; DrawTarget keeps only this stripe's pixels.
             renderer.render(ctx, lcd);
-            lcd.flush_band().await;
+            lcd.flush_band(look).await;
             y = y.saturating_add(h);
         }
     }
 
     /// Render interactive modifier feedback once before touching the panel.
-    async fn present_modifiers(&mut self, renderer: &QubeStatusRenderer, ctx: &RenderContext) {
+    async fn present_modifiers(
+        &mut self,
+        renderer: &QubeStatusRenderer,
+        ctx: &RenderContext,
+        band: Band,
+        look: &Look,
+    ) {
         self.ensure_init().await;
         let LcdState::Active(lcd) = &mut self.state else {
             return;
         };
-        let DirtyRegion::Range { y0, y1 } = MODIFIER_DIRTY else {
-            return;
-        };
 
-        lcd.set_band(y0, y1.saturating_sub(y0));
+        lcd.set_band(if band.y < 0 { 0 } else { band.y as u16 }, band.h as u16);
         lcd.clear_stripe(COL_BG);
-        renderer.render_modifiers(ctx, lcd);
-        lcd.flush_band().await;
+        renderer.render_modifiers(ctx, lcd, band);
+        lcd.flush_band(look).await;
     }
 }
 
@@ -550,10 +920,20 @@ where
     lcd: LazyQubeLcd<I>,
     renderer: QubeStatusRenderer,
     ctx: RenderContext,
+    /// Panel backlight (P0_02, plain GPIO): switched off while the screen is
+    /// blanked by the idle timeout.
+    backlight: &'static mut Output<'static>,
     /// Uptime when this processor was created — drives the boot splash.
     boot_at: Instant,
     last_host_data: rmk::host_data::HostData,
     last_layer_names_version: u8,
+    /// Settings snapshot used by the layout and by the look post-pass.
+    settings: ScreenSettings,
+    last_screen_settings_version: u8,
+    /// Idle blanking state and the last user activity that resets it.
+    blanked: bool,
+    blank_frame_due: bool,
+    last_activity: Instant,
     last_render: Instant,
     last_modifier_render: Instant,
     pending: bool,
@@ -579,14 +959,11 @@ where
         > + Copy
         + 'static,
 {
-    let level = if BACKLIGHT_ACTIVE_HIGH {
-        Level::High
-    } else {
-        Level::Low
-    };
+    let level = backlight_level(true);
     static BL: StaticCell<Output<'static>> = StaticCell::new();
-    let _ = BL.init(Output::new(bl, level, OutputDrive::Standard));
+    let backlight = BL.init(Output::new(bl, level, OutputDrive::Standard));
     let host_data = rmk::host_data::snapshot();
+    let settings = layer_names::screen_settings();
 
     DongleScreen {
         lcd: LazyQubeLcd {
@@ -600,20 +977,31 @@ where
             }),
             irq,
         },
-        renderer: QubeStatusRenderer {
-            host_data: host_data.clone(),
-            splash: true,
-        },
+        renderer: QubeStatusRenderer::new(host_data.clone(), true),
         ctx: RenderContext::default(),
+        backlight,
         boot_at: Instant::now(),
         last_host_data: host_data,
-        last_layer_names_version: crate::layer_names::version(),
+        last_layer_names_version: layer_names::version(),
+        settings,
+        last_screen_settings_version: layer_names::screen_settings_version(),
+        blanked: false,
+        blank_frame_due: false,
+        last_activity: Instant::now(),
         last_render: Instant::from_ticks(0),
         last_modifier_render: Instant::from_ticks(0),
         pending: true,
         modifier_pending: false,
         dirty: DirtyRegion::Full,
         min_interval: Duration::from_millis(80),
+    }
+}
+
+fn backlight_level(on: bool) -> Level {
+    if on == BACKLIGHT_ACTIVE_HIGH {
+        Level::High
+    } else {
+        Level::Low
     }
 }
 
@@ -658,11 +1046,29 @@ where
     async fn redraw(&mut self) {
         self.sync_host_data();
         self.sync_layer_names();
+        self.sync_settings();
         if self.redraw_wait() != Duration::MIN {
             self.pending = true;
             return;
         }
-        self.lcd.present_dirty(&mut self.renderer, &self.ctx, self.dirty).await;
+        if self.blanked {
+            // The backlight is off; paint one black frame so the panel buffer
+            // matches the dark screen, then stay quiet until an event wakes us.
+            if self.blank_frame_due {
+                self.blank_frame_due = false;
+                let look = self.look();
+                self.lcd
+                    .present_dirty(&mut self.renderer, &self.ctx, DirtyRegion::Full, &look)
+                    .await;
+            }
+            self.pending = false;
+            self.dirty = DirtyRegion::Full;
+            return;
+        }
+        let look = self.look();
+        self.lcd
+            .present_dirty(&mut self.renderer, &self.ctx, self.dirty, &look)
+            .await;
         self.ctx.key_press_latch = false;
         self.pending = false;
         self.dirty = DirtyRegion::Full;
@@ -670,11 +1076,16 @@ where
     }
 
     async fn redraw_modifiers(&mut self) {
-        if self.modifier_redraw_wait() != Duration::MIN {
+        if self.blanked || self.modifier_redraw_wait() != Duration::MIN {
             return;
         }
+        let Some(band) = self.renderer.layout().modifiers else {
+            self.modifier_pending = false;
+            return;
+        };
+        let look = self.look();
         self.lcd
-            .present_modifiers(&self.renderer, &self.ctx)
+            .present_modifiers(&self.renderer, &self.ctx, band, &look)
             .await;
         self.modifier_pending = false;
         self.last_modifier_render = Instant::now();
@@ -694,6 +1105,19 @@ where
         self.modifier_pending = true;
     }
 
+    /// The badge lives either in the header or in the chip row, so a transport
+    /// change repaints whichever band currently carries it.
+    fn request_badge_redraw(&mut self) {
+        if !self.renderer.settings.output_visible {
+            return;
+        }
+        if self.renderer.settings.output_place == SCREEN_OUTPUT_CHIP {
+            self.request_modifier_redraw();
+        } else {
+            self.request_redraw_region(HEADER_DIRTY);
+        }
+    }
+
     fn sync_host_data(&mut self) {
         let host_data = rmk::host_data::snapshot();
         if host_data != self.last_host_data {
@@ -704,11 +1128,58 @@ where
     }
 
     fn sync_layer_names(&mut self) {
-        let version = crate::layer_names::version();
+        let version = layer_names::version();
         if version != self.last_layer_names_version {
             self.last_layer_names_version = version;
-            self.request_redraw_region(LAYER_DIRTY);
+            self.request_redraw_region(row_dirty(self.renderer.layout().row));
         }
+    }
+
+    /// Re-reads the settings whenever a client changed one and repaints the
+    /// whole frame (zones may have moved, colours changed).
+    fn sync_settings(&mut self) {
+        let version = layer_names::screen_settings_version();
+        if version == self.last_screen_settings_version {
+            return;
+        }
+        self.last_screen_settings_version = version;
+        self.settings = layer_names::screen_settings();
+        self.renderer.settings = self.settings;
+        self.request_redraw();
+    }
+
+    fn look(&self) -> Look {
+        Look::from_settings(&self.renderer.settings, self.blanked)
+    }
+
+    /// Any keyboard/connection event counts as activity: it clears the blank
+    /// and restarts the idle timer.
+    fn note_activity(&mut self) {
+        self.last_activity = Instant::now();
+        if self.blanked {
+            self.blanked = false;
+            self.blank_frame_due = false;
+            self.backlight.set_level(backlight_level(true));
+            self.request_redraw();
+        }
+    }
+
+    /// Turns the panel dark once the configured idle timeout elapsed.
+    fn check_idle_timeout(&mut self) {
+        if self.blanked {
+            return;
+        }
+        let timeout = self.renderer.settings.timeout_s;
+        if timeout == 0 {
+            return;
+        }
+        if self.last_activity.elapsed() < Duration::from_secs(timeout as u64) {
+            return;
+        }
+        self.blanked = true;
+        self.blank_frame_due = true;
+        self.backlight.set_level(backlight_level(false));
+        self.request_redraw();
     }
 }
 
@@ -743,6 +1214,7 @@ where
         let mut sleep_sub = SleepStateEvent::subscriber();
         let mut bat_sub = BatteryStatusEvent::subscriber();
         let mut conn_sub = ConnectionStatusChangeEvent::subscriber();
+        let mut adv_sub = BleAdvertisingModeEvent::subscriber();
         let mut peri_conn_sub = PeripheralConnectedEvent::subscriber();
         let mut peri_bat_sub = PeripheralBatteryEvent::subscriber();
         let mut central_sub = CentralConnectedEvent::subscriber();
@@ -761,6 +1233,7 @@ where
                         &mut sleep_sub,
                         &mut bat_sub,
                         &mut conn_sub,
+                        &mut adv_sub,
                         &mut peri_conn_sub,
                         &mut peri_bat_sub,
                         &mut central_sub,
@@ -783,6 +1256,7 @@ where
                     &mut sleep_sub,
                     &mut bat_sub,
                     &mut conn_sub,
+                    &mut adv_sub,
                     &mut peri_conn_sub,
                     &mut peri_bat_sub,
                     &mut central_sub,
@@ -805,6 +1279,7 @@ where
                         &mut sleep_sub,
                         &mut bat_sub,
                         &mut conn_sub,
+                        &mut adv_sub,
                         &mut peri_conn_sub,
                         &mut peri_bat_sub,
                         &mut central_sub,
@@ -820,6 +1295,7 @@ where
             if self.modifier_pending {
                 self.redraw_modifiers().await;
             }
+            self.check_idle_timeout();
             if self.pending {
                 self.redraw().await;
             }
@@ -837,6 +1313,7 @@ enum UiEv {
     Sleep(SleepStateEvent),
     Bat(BatteryStatusEvent),
     Conn(ConnectionStatusChangeEvent),
+    Adv(BleAdvertisingModeEvent),
     PeriConn(PeripheralConnectedEvent),
     PeriBat(PeripheralBatteryEvent),
     Central(CentralConnectedEvent),
@@ -860,6 +1337,7 @@ where
         sleep: &mut impl EventSubscriber<Event = SleepStateEvent>,
         bat: &mut impl EventSubscriber<Event = BatteryStatusEvent>,
         conn: &mut impl EventSubscriber<Event = ConnectionStatusChangeEvent>,
+        adv: &mut impl EventSubscriber<Event = BleAdvertisingModeEvent>,
         peri_conn: &mut impl EventSubscriber<Event = PeripheralConnectedEvent>,
         peri_bat: &mut impl EventSubscriber<Event = PeripheralBatteryEvent>,
         central: &mut impl EventSubscriber<Event = CentralConnectedEvent>,
@@ -867,7 +1345,7 @@ where
         match select(
             Timer::after(Duration::from_millis(250)),
             Self::next_any(
-                layer, wpm, led, mods, key, sleep, bat, conn, peri_conn, peri_bat, central,
+                layer, wpm, led, mods, key, sleep, bat, conn, adv, peri_conn, peri_bat, central,
             ),
         )
         .await
@@ -886,6 +1364,7 @@ where
         sleep: &mut impl EventSubscriber<Event = SleepStateEvent>,
         bat: &mut impl EventSubscriber<Event = BatteryStatusEvent>,
         conn: &mut impl EventSubscriber<Event = ConnectionStatusChangeEvent>,
+        adv: &mut impl EventSubscriber<Event = BleAdvertisingModeEvent>,
         peri_conn: &mut impl EventSubscriber<Event = PeripheralConnectedEvent>,
         peri_bat: &mut impl EventSubscriber<Event = PeripheralBatteryEvent>,
         central: &mut impl EventSubscriber<Event = CentralConnectedEvent>,
@@ -898,7 +1377,7 @@ where
             select3(layer.next_event(), wpm.next_event(), led.next_event()),
             select3(mods.next_event(), key.next_event(), sleep.next_event()),
             select3(
-                select(bat.next_event(), conn.next_event()),
+                select3(bat.next_event(), conn.next_event(), adv.next_event()),
                 select(peri_conn.next_event(), peri_bat.next_event()),
                 central.next_event(),
             ),
@@ -911,8 +1390,9 @@ where
             Either3::Second(Either3::First(e)) => UiEv::Mod(e),
             Either3::Second(Either3::Second(e)) => UiEv::Key(e),
             Either3::Second(Either3::Third(e)) => UiEv::Sleep(e),
-            Either3::Third(Either3::First(Either::First(e))) => UiEv::Bat(e),
-            Either3::Third(Either3::First(Either::Second(e))) => UiEv::Conn(e),
+            Either3::Third(Either3::First(Either3::First(e))) => UiEv::Bat(e),
+            Either3::Third(Either3::First(Either3::Second(e))) => UiEv::Conn(e),
+            Either3::Third(Either3::First(Either3::Third(e))) => UiEv::Adv(e),
             Either3::Third(Either3::Second(Either::First(e))) => UiEv::PeriConn(e),
             Either3::Third(Either3::Second(Either::Second(e))) => UiEv::PeriBat(e),
             Either3::Third(Either3::Third(e)) => UiEv::Central(e),
@@ -922,19 +1402,26 @@ where
     fn apply(&mut self, ev: UiEv) {
         // Keyboard matrix floods KeyboardEvent; UI doesn't show individual
         // keys — skip redraw for those so multipass can keep up with layer/mod.
+        // Every real event (but not the bare host-data tick) counts as user
+        // activity and wakes a blanked screen.
+        if !matches!(&ev, UiEv::HostDataTick) {
+            self.note_activity();
+        }
         let mut need_redraw = true;
         match ev {
             UiEv::Layer(e) => {
                 self.ctx.layer = e.0;
-                self.request_redraw_region(LAYER_DIRTY);
+                self.request_redraw_region(row_dirty(self.renderer.layout().row));
                 need_redraw = false;
             }
             UiEv::Wpm(e) => {
                 // Only repaint when the number really changed: RMK may publish
-                // repeated WPM updates and each band repaint costs two stripes.
+                // repeated WPM updates and each band repaint costs a stripe.
                 if self.ctx.wpm != e.0 {
                     self.ctx.wpm = e.0;
-                    self.request_redraw_region(WPM_DIRTY);
+                    // The WPM block shares the row with the layer name: there is
+                    // no separate band to repaint.
+                    self.request_redraw_region(row_dirty(self.renderer.layout().row));
                 }
                 need_redraw = false;
             }
@@ -959,20 +1446,38 @@ where
             UiEv::Sleep(e) => self.ctx.sleeping = e.0,
             UiEv::Bat(e) => {
                 self.ctx.battery = e;
-                self.request_redraw_region(BATTERY_DIRTY);
+                if let Some(bat) = self.renderer.layout().batteries {
+                    self.request_redraw_region(band_dirty(bat));
+                }
                 need_redraw = false;
             }
-            UiEv::Conn(e) => self.ctx.ble_status = e.0.ble,
+            UiEv::Conn(e) => {
+                self.ctx.ble_status = e.0.ble;
+                self.renderer.connection = e.0;
+                self.request_badge_redraw();
+                need_redraw = false;
+            }
+            UiEv::Adv(e) => {
+                self.renderer.advertising = Some(e.0);
+                self.request_badge_redraw();
+                need_redraw = false;
+            }
             UiEv::PeriConn(e) => {
                 if let Some(slot) = self.ctx.peripherals_connected.get_mut(e.id) {
                     *slot = e.connected;
                 }
+                if let Some(bat) = self.renderer.layout().batteries {
+                    self.request_redraw_region(band_dirty(bat));
+                }
+                need_redraw = false;
             }
             UiEv::PeriBat(e) => {
                 if let Some(slot) = self.ctx.peripheral_batteries.get_mut(e.id) {
                     *slot = e.state;
                 }
-                self.request_redraw_region(BATTERY_DIRTY);
+                if let Some(bat) = self.renderer.layout().batteries {
+                    self.request_redraw_region(band_dirty(bat));
+                }
                 need_redraw = false;
             }
             UiEv::Central(e) => self.ctx.central_connected = e.connected,
@@ -983,6 +1488,7 @@ where
                 }
                 self.sync_host_data();
                 self.sync_layer_names();
+                self.sync_settings();
                 if self.renderer.media_needs_marquee() {
                     self.request_redraw_region(HEADER_DIRTY);
                 }
@@ -1017,63 +1523,129 @@ where
 
 // --- Full-screen UI ---------------------------------------------------------
 //
-// Fixed vertical zones (280x240) so nothing overlaps:
-//   14..42   compact header
+// Vertical zones (280x240) so nothing overlaps:
+//   14..42   compact header (indicator + media ticker + clock)
 //   46..100  layer panel (compact, x2 name)
 //   106..160 WPM panel (x2 value)
 //   166..182 modifier state
 //   188..228 battery cards
+//
+// Hiding a zone moves the ones below it up and hands the freed height to the
+// layer panel; see `compute_layout`.
 
 pub struct QubeStatusRenderer {
     host_data: rmk::host_data::HostData,
     /// Boot splash is on screen, the dashboard is not drawn yet.
     splash: bool,
+    /// Screen settings snapshot (kept in sync by [`DongleScreen::sync_settings`]).
+    settings: ScreenSettings,
+    /// Last `ConnectionStatusChangeEvent`.
+    connection: ConnectionStatus,
+    /// Last `BleAdvertisingModeEvent`, used to tell pairing from reconnecting.
+    advertising: Option<BleAdvertisingMode>,
 }
 
 impl QubeStatusRenderer {
-    fn media_needs_marquee(&self) -> bool {
-        let mut media: heapless::String<72> = heapless::String::new();
-        push_media_label(&mut media, &self.host_data);
-        media.len() > MEDIA_VISIBLE_CHARS
+    pub fn new(host_data: rmk::host_data::HostData, splash: bool) -> Self {
+        Self {
+            host_data,
+            splash,
+            settings: layer_names::screen_settings(),
+            connection: ConnectionStatus::default(),
+            advertising: None,
+        }
     }
 
-    fn render_modifiers<D: DrawTarget<Color = Rgb565>>(&self, ctx: &RenderContext, display: &mut D) {
+    fn layout(&self) -> Layout {
+        compute_layout(&self.settings)
+    }
+
+    fn geometry(&self) -> Geometry {
+        geometry(&self.settings)
+    }
+
+    /// Badge text + colour for the current connection state.
+    fn output_badge(&self) -> (heapless::String<OUTPUT_BADGE_CHARS>, Rgb565) {
+        OutputState::from_connection(&self.connection, self.advertising).badge()
+    }
+
+    fn media_needs_marquee(&self) -> bool {
+        if !self.settings.shows_media() {
+            return false;
+        }
+        let mut media: heapless::String<72> = heapless::String::new();
+        push_media_label(&mut media, &self.host_data);
+        media.len() > self.geometry().media_limit
+    }
+
+    /// Modifier chips (six fixed slots in v2; the last one is the badge when the
+    /// placement setting says so).
+    fn render_modifiers<D: DrawTarget<Color = Rgb565>>(
+        &self,
+        ctx: &RenderContext,
+        display: &mut D,
+        band: Band,
+    ) {
         if self.splash {
             return;
         }
-        draw_chip(display, 30, 166, 38, "CAPS", ctx.caps_lock);
+        let y = band.y;
+        draw_chip(display, 26, y, 34, "CAPS", ctx.caps_lock);
         draw_chip(
             display,
-            76,
-            166,
-            38,
+            64,
+            y,
+            34,
             "CTRL",
             ctx.modifiers.left_ctrl() || ctx.modifiers.right_ctrl(),
         );
         draw_chip(
             display,
-            122,
-            166,
-            46,
+            102,
+            y,
+            42,
             "SHIFT",
             ctx.modifiers.left_shift() || ctx.modifiers.right_shift(),
         );
         draw_chip(
             display,
-            176,
-            166,
-            34,
+            148,
+            y,
+            30,
             "ALT",
             ctx.modifiers.left_alt() || ctx.modifiers.right_alt(),
         );
         draw_chip(
             display,
-            218,
-            166,
-            34,
+            182,
+            y,
+            30,
             "GUI",
             ctx.modifiers.left_gui() || ctx.modifiers.right_gui(),
         );
+        if self.settings.output_visible && self.settings.output_place == SCREEN_OUTPUT_CHIP {
+            let (text, color) = self.output_badge();
+            let rect = Rectangle::new(
+                Point::new(BADGE_CHIP_X, y),
+                Size::new(BADGE_CHIP_W, band.h),
+            );
+            let style = PrimitiveStyleBuilder::new()
+                .fill_color(COL_ACCENT_DIM)
+                .stroke_color(color)
+                .stroke_width(1)
+                .build();
+            let _ = RoundedRectangle::with_equal_corners(rect, Size::new(CHIP_RADIUS, CHIP_RADIUS))
+                .into_styled(style)
+                .draw(display);
+            draw_round_fill(display, BADGE_CHIP_X + 6, y + 3, 3, 10, 2, color);
+            let _ = Text::with_text_style(
+                &text,
+                Point::new(BADGE_CHIP_X + 12, y + 3),
+                MonoTextStyle::new(&FONT_6X10, COL_FG),
+                TextStyleBuilder::new().baseline(Baseline::Top).build(),
+            )
+            .draw(display);
+        }
     }
 }
 
@@ -1086,11 +1658,14 @@ impl DisplayRenderer<Rgb565> for QubeStatusRenderer {
             return;
         }
 
+        let layout = self.layout();
+        let geo = self.geometry();
+        let settings = self.settings;
         let layer_meta = MonoTextStyle::new(&FONT_6X10, COL_LABEL);
         let header_media = MonoTextStyle::new(&FONT_6X10, COL_FG);
         let header_fallback = MonoTextStyle::new(&FONT_8X13, COL_ACCENT);
         let body = MonoTextStyle::new(&FONT_8X13, COL_FG);
-        let wpm_label = MonoTextStyle::new(&FONT_6X10, COL_MUTED);
+        let badge_text_style = MonoTextStyle::new(&FONT_6X10, COL_FG);
         let top_left = TextStyleBuilder::new().baseline(Baseline::Top).build();
         let tr = TextStyleBuilder::new()
             .alignment(Alignment::Right)
@@ -1100,76 +1675,160 @@ impl DisplayRenderer<Rgb565> for QubeStatusRenderer {
         let right = ctx.peripherals_connected.get(1).copied().unwrap_or(false);
         let lp = battery_reading(ctx.peripheral_batteries.first().map(|b| b.0));
         let rp = battery_reading(ctx.peripheral_batteries.get(1).map(|b| b.0));
-        let mut custom_name = [0u8; crate::layer_names::LAYER_NAME_MAX];
-        let name = crate::layer_names::copy_layer_name(ctx.layer, &mut custom_name)
+        let mut custom_name = [0u8; layer_names::LAYER_NAME_MAX];
+        let name = layer_names::copy_layer_name(ctx.layer, &mut custom_name)
             .and_then(|len| core::str::from_utf8(&custom_name[..len]).ok())
             .unwrap_or_else(|| layer_name(ctx.layer));
 
         // Header.
-        draw_panel(display, SAFE_X, 14, SAFE_W, 28, COL_PANEL, COL_BORDER_DIM);
-        draw_round_fill(display, SAFE_X + 11, 23, 3, 10, 2, COL_ACCENT);
-        let mut s: heapless::String<16> = heapless::String::new();
-        draw_media_or_fallback(display, &self.host_data, header_media, header_fallback);
-        if host_time_available(&self.host_data) {
-            push_host_time(&mut s, self.host_data.hour, self.host_data.minute);
-            let _ =
-                Text::with_text_style(&s, Point::new(SAFE_X + SAFE_W as i32 - 14, 21), body, tr)
-                    .draw(display);
-        }
-
-        // Layer panel (compact strip, x2 name).
         draw_panel(
             display,
             SAFE_X,
-            46,
+            layout.header.y,
             SAFE_W,
-            54,
+            layout.header.h,
+            COL_PANEL,
+            COL_BORDER_DIM,
+        );
+        let (badge_text, badge_color) = self.output_badge();
+        // Decorative accent dot, unchanged from the pre-settings frame.
+        draw_round_fill(
+            display,
+            SAFE_X + 11,
+            layout.header.y + 9,
+            3,
+            10,
+            2,
+            COL_ACCENT,
+        );
+        let clock_drawn = match settings.header_mode {
+            SCREEN_HEADER_CLOCK => true,
+            SCREEN_HEADER_MEDIA => false,
+            _ => host_time_available(&self.host_data),
+        };
+        let mut s: heapless::String<16> = heapless::String::new();
+        draw_media_or_fallback(
+            display,
+            &self.host_data,
+            &settings,
+            geo.media_x,
+            geo.media_limit,
+            layout.header.y,
+            clock_drawn,
+            header_media,
+            header_fallback,
+        );
+        if clock_drawn {
+            push_host_time(&mut s, self.host_data.hour, self.host_data.minute);
+            let _ = Text::with_text_style(
+                &s,
+                Point::new(geo.clock_right, layout.header.y + 7),
+                body,
+                tr,
+            )
+            .draw(display);
+        }
+        // Connection badge: right end of the header, after the clock.
+        if geo.badge_in_header {
+            let dot_x = geo.header_right - geo.badge_w;
+            draw_round_fill(display, dot_x, layout.header.y + 9, 3, 10, 2, badge_color);
+            let _ = Text::with_text_style(
+                &badge_text,
+                Point::new(dot_x + 7, layout.header.y + 8),
+                badge_text_style,
+                top_left,
+            )
+            .draw(display);
+        }
+
+        // One row: layer name on the left, compact WPM block on the right.
+        // The row absorbs the height of every hidden zone.
+        draw_panel(
+            display,
+            SAFE_X,
+            layout.row.y,
+            SAFE_W,
+            layout.row.h,
             COL_PANEL_HI,
             COL_BORDER_DIM,
         );
         s.clear();
         let _ = write!(&mut s, "L{}", ctx.layer);
-        let _ = Text::with_text_style(&s, Point::new(SAFE_X + 12, 50), layer_meta, top_left)
+        let _ = Text::with_text_style(
+            &s,
+            Point::new(geo.name_x, layout.row.y + 6),
+            layer_meta,
+            top_left,
+        )
+        .draw(display);
+
+        // Compact WPM: caption above the value, both FONT_6X10, right aligned.
+        if settings.wpm_visible {
+            let stack_h = 10 + 4 + 10;
+            let top = layout.row.y + (layout.row.h as i32 - stack_h) / 2;
+            let _ = Text::with_text_style(
+                "WPM",
+                Point::new(geo.wpm_right, top),
+                MonoTextStyle::new(&FONT_6X10, COL_MUTED),
+                tr,
+            )
             .draw(display);
-        if !name.is_empty() {
-            draw_text_x2(
-                display,
-                name,
-                Point::new(LAYER_NAME_TOP.x + 1, LAYER_NAME_TOP.y + 1),
-                MonoTextStyle::new(&FONT_10X20, COL_ACCENT_DIM),
-                Alignment::Center,
-            );
-            draw_text_x2(
-                display,
-                name,
-                LAYER_NAME_TOP,
-                MonoTextStyle::new(&FONT_10X20, COL_FG),
-                Alignment::Center,
-            );
+            s.clear();
+            let _ = write!(&mut s, "{}", ctx.wpm);
+            let _ = Text::with_text_style(
+                &s,
+                Point::new(geo.wpm_right, top + 14),
+                MonoTextStyle::new(&FONT_6X10, COL_ACCENT),
+                tr,
+            )
+            .draw(display);
         }
 
-        // WPM panel (x2 value).
-        draw_panel(display, SAFE_X, 106, SAFE_W, 54, COL_PANEL, COL_BORDER_DIM);
-        s.clear();
-        let _ = write!(&mut s, "WPM");
-        let _ = Text::with_text_style(&s, Point::new(SAFE_X + 12, 112), wpm_label, top_left)
-            .draw(display);
-        s.clear();
-        let _ = write!(&mut s, "{}", ctx.wpm);
-        draw_text_x2(
+        draw_layer_name_fitted(
             display,
-            &s,
-            WPM_VALUE_RIGHT_TOP,
-            MonoTextStyle::new(&FONT_10X20, COL_ACCENT),
-            Alignment::Right,
+            name,
+            geo.name_x,
+            layout.row,
+            geo.name_limit - geo.name_x,
+            geo.f10,
         );
 
         // Modifier chips.
-        self.render_modifiers(ctx, display);
+        if let Some(mods) = layout.modifiers {
+            self.render_modifiers(ctx, display, mods);
+        }
 
         // Battery cards.
-        draw_bat(display, SAFE_X, 188, 116, lp, left, "LEFT");
-        draw_bat(display, 146, 188, 116, rp, right, "RIGHT");
+        if let Some(bat) = layout.batteries {
+            let left_label = fit_battery_label(
+                settings.left_label.as_str(),
+                BATTERY_CARD_W,
+                battery_value_len(lp, left),
+            );
+            let right_label = fit_battery_label(
+                settings.right_label.as_str(),
+                BATTERY_CARD_W,
+                battery_value_len(rp, right),
+            );
+            draw_bat(
+                display,
+                SAFE_X,
+                bat.y,
+                BATTERY_CARD_W,
+                lp,
+                left,
+                left_label.as_str(),
+            );
+            draw_bat(
+                display,
+                SAFE_X + BATTERY_CARD_W + BATTERY_CARD_GAP,
+                bat.y,
+                BATTERY_CARD_W,
+                rp,
+                right,
+                right_label.as_str(),
+            );
+        }
     }
 }
 
@@ -1295,6 +1954,112 @@ fn battery_reading(status: Option<BatteryStatus>) -> BatReading {
     }
 }
 
+/// Width of the value text `draw_bat` right-aligns: `--`, `??` or `NN%`.
+fn battery_value_len(reading: BatReading, connected: bool) -> usize {
+    match (connected, reading) {
+        (false, _) | (true, BatReading::Unknown) | (true, BatReading::Pending) => 2,
+        (true, BatReading::Pct(pct)) => {
+            let digits = if pct >= 100 {
+                3
+            } else if pct >= 10 {
+                2
+            } else {
+                1
+            };
+            digits + 1
+        }
+    }
+}
+
+/// Draws the layer name at the largest size that fits the row:
+/// 2× if it fits, else 1×, else 1× truncated with a trailing `..`.
+/// Same stepped rule as the stand's `draw_layer_name_fitted`.
+fn draw_layer_name_fitted<D>(
+    display: &mut D,
+    name: &str,
+    x: i32,
+    row: Band,
+    avail: i32,
+    f10: i32,
+) where
+    D: DrawTarget<Color = Rgb565>,
+{
+    if name.is_empty() {
+        return;
+    }
+    let len = name.chars().count() as i32;
+    let two_x_px = 2 * f10 * len;
+    let one_x_px = f10 * len;
+
+    if two_x_px <= avail {
+        let y = row.y + (row.h as i32 - 22 * 2) / 2;
+        draw_text_x2(
+            display,
+            name,
+            Point::new(x + 1, y + 1),
+            MonoTextStyle::new(&FONT_10X20, COL_ACCENT_DIM),
+            Alignment::Left,
+        );
+        draw_text_x2(
+            display,
+            name,
+            Point::new(x, y),
+            MonoTextStyle::new(&FONT_10X20, COL_FG),
+            Alignment::Left,
+        );
+    } else if one_x_px <= avail {
+        let y = row.y + (row.h as i32 - 20) / 2;
+        let top_left = TextStyleBuilder::new().baseline(Baseline::Top).build();
+        let _ = Text::with_text_style(
+            name,
+            Point::new(x + 1, y + 1),
+            MonoTextStyle::new(&FONT_10X20, COL_ACCENT_DIM),
+            top_left,
+        )
+        .draw(display);
+        let _ = Text::with_text_style(
+            name,
+            Point::new(x, y),
+            MonoTextStyle::new(&FONT_10X20, COL_FG),
+            top_left,
+        )
+        .draw(display);
+    } else {
+        let keep = ((avail - 2 * f10) / f10).max(1) as usize;
+        let mut cut: heapless::String<16> = heapless::String::new();
+        for ch in name.chars().take(keep) {
+            let _ = cut.push(ch);
+        }
+        let _ = cut.push_str("..");
+        let y = row.y + (row.h as i32 - 20) / 2;
+        let _ = Text::with_text_style(
+            cut.as_str(),
+            Point::new(x, y),
+            MonoTextStyle::new(&FONT_10X20, COL_FG),
+            TextStyleBuilder::new().baseline(Baseline::Top).build(),
+        )
+        .draw(display);
+    }
+}
+
+/// Clips a card label to the space left of the value. `draw_bat` puts the
+/// label at `x + 10` (FONT_6X10) and the value right-aligned at `x + w - 12`
+/// (FONT_10X20), leaving a 6 px gap — the same budget the host stand uses, so
+/// the PNG previews and the panel truncate identically.
+fn fit_battery_label(label: &str, card_w: i32, value_len: usize) -> heapless::String<BATTERY_LABEL_MAX> {
+    let value_px = value_len as i32 * 10;
+    let max_px = ((card_w - 12) - value_px - 6) - 10;
+    let max_chars = (max_px.max(0) / 6) as usize;
+    let mut text: heapless::String<BATTERY_LABEL_MAX> = heapless::String::new();
+    for (index, ch) in label.chars().enumerate() {
+        if index >= max_chars {
+            break;
+        }
+        let _ = text.push(ch);
+    }
+    text
+}
+
 fn draw_bat<D: DrawTarget<Color = Rgb565>>(
     display: &mut D,
     x: i32,
@@ -1394,33 +2159,44 @@ fn push_host_time(buffer: &mut heapless::String<16>, hour: Option<u8>, minute: O
 fn draw_media_or_fallback<D: DrawTarget<Color = Rgb565>>(
     display: &mut D,
     host_data: &rmk::host_data::HostData,
+    settings: &ScreenSettings,
+    media_x: i32,
+    media_limit: usize,
+    header_y: i32,
+    clock_drawn: bool,
     media_style: MonoTextStyle<'_, Rgb565>,
     fallback_style: MonoTextStyle<'_, Rgb565>,
 ) {
+    if !settings.shows_media() {
+        return;
+    }
     let top = TextStyleBuilder::new().baseline(Baseline::Top).build();
     let mut media: heapless::String<72> = heapless::String::new();
     push_media_label(&mut media, host_data);
 
     if media.is_empty() {
-        if !host_time_available(host_data) {
-            let _ = Text::with_text_style("QUBE", Point::new(SAFE_X + 22, 21), fallback_style, top)
+        // With a clock on screen the wordmark stays away; in media-only mode it
+        // is the only thing that can fill the header.
+        if !clock_drawn {
+            let _ = Text::with_text_style("QUBE", Point::new(media_x, header_y + 7), fallback_style, top)
                 .draw(display);
         }
         return;
     }
 
+    let visible_chars = media_limit;
     let mut visible: heapless::String<32> = heapless::String::new();
-    if media.len() <= MEDIA_VISIBLE_CHARS {
+    if media.chars().count() <= visible_chars {
         let _ = visible.push_str(&media);
     } else {
         let elapsed = Instant::now()
             .duration_since(Instant::from_ticks(0))
             .as_millis() as usize;
         let offset = (elapsed / 300) % (media.len() + MEDIA_GAP_CHARS);
-        push_marquee_slice(&mut visible, &media, offset);
+        push_marquee_slice(&mut visible, &media, offset, visible_chars);
     }
 
-    let _ = Text::with_text_style(&visible, Point::new(SAFE_X + 22, 22), media_style, top)
+    let _ = Text::with_text_style(&visible, Point::new(media_x, header_y + 8), media_style, top)
         .draw(display);
 }
 
@@ -1449,10 +2225,15 @@ fn push_ascii_text<const N: usize>(buffer: &mut heapless::String<N>, value: &str
     }
 }
 
-fn push_marquee_slice(buffer: &mut heapless::String<32>, text: &str, offset: usize) {
+fn push_marquee_slice(
+    buffer: &mut heapless::String<32>,
+    text: &str,
+    offset: usize,
+    visible_chars: usize,
+) {
     let bytes = text.as_bytes();
     let cycle_len = bytes.len() + MEDIA_GAP_CHARS;
-    for i in 0..MEDIA_VISIBLE_CHARS {
+    for i in 0..visible_chars {
         let idx = (offset + i) % cycle_len;
         let ch = if idx < bytes.len() {
             bytes[idx] as char
