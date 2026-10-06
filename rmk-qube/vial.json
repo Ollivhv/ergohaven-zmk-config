@@ -62,6 +62,24 @@
                     "variants": ["Header", "Chip row"]
                 },
                 {
+                    "type": "select",
+                    "title": "Screen concept",
+                    "qsid": 228,
+                    "variants": [
+                        "Dashboard v2",
+                        "HUD",
+                        "Terminal",
+                        "Minimal",
+                        "Tiles",
+                        "Speedo",
+                        "Infocenter",
+                        "Two-column",
+                        "Sparkline",
+                        "Signal",
+                        "Mood"
+                    ]
+                },
+                {
                     "type": "integer",
                     "title": "Display brightness",
                     "qsid": 318,

@@ -21,7 +21,7 @@
 //! ```text
 //! off  size  field
 //!   0     1  marker 0xE5
-//!   1     1  version (3)
+//!   1     1  version (5)
 //!   2   176  layer names: 16 x [len: u8, 10 bytes]
 //! 178     1  screen flags (bit0 wpm, bit1 modifiers, bit2 batteries, bit3 output)
 //! 179     1  header mode (0 media, 1 clock, 2 media + clock)
@@ -34,9 +34,13 @@
 //! 192     6  left battery label bytes
 //! 198     1  right battery label length
 //! 199     6  right battery label bytes
-//! 205        (end of record, 19 bytes of the 224-byte budget stay unused)
+//! 205     1  connection badge placement (0 header, 1 chip row)
+//! 206     1  screen concept (0 dashboard v2, 1..=10 alternative layouts)
+//! 207        (end of record, 17 bytes of the 224-byte budget stay unused)
 //! ```
 //!
+//! Version 4 lacked the screen-concept byte, version 3 additionally lacked the
+//! badge placement; all older records are still read and upgraded in place.
 //! Version 2 used `LAYER_NAME_MAX = 12` (210 bytes of names, no screen
 //! settings), version 1 additionally stored placeholder names that have to be
 //! migrated to the factory profile. Both are still readable.
@@ -81,6 +85,10 @@ pub const QSID_SCREEN_ACCENT_DIM_B: u16 = QSID_SCREEN_ACCENT_DIM + 2;
 /// Where the connection badge lives: `0` right end of the header (default),
 /// `1` sixth slot of the modifier row.
 pub const QSID_SCREEN_OUTPUT_PLACE: u16 = 227;
+/// Screen concept: `0` = dashboard v2 (the shipped layout), `1..=10` = one of
+/// the alternative whole-screen layouts. **The numbers are a contract with
+/// Entropy — never renumber them.**
+pub const QSID_SCREEN_CONCEPT: u16 = 228;
 /// Software brightness, 10..=100. Same QSID the Ergohaven LCD screens use.
 pub const QSID_SCREEN_BRIGHTNESS: u16 = 318;
 /// Accent colour R/G/B. Same QSID pair group as the Ergohaven LCD text colour.
@@ -98,6 +106,21 @@ pub const SCREEN_HEADER_BOTH: u8 = 2;
 
 pub const SCREEN_OUTPUT_HEADER: u8 = 0;
 pub const SCREEN_OUTPUT_CHIP: u8 = 1;
+
+// Screen concepts, in the order Entropy lists them (QSID 228).
+pub const SCREEN_CONCEPT_DASHBOARD: u8 = 0;
+pub const SCREEN_CONCEPT_HUD: u8 = 1;
+pub const SCREEN_CONCEPT_TERMINAL: u8 = 2;
+pub const SCREEN_CONCEPT_MINIMAL: u8 = 3;
+pub const SCREEN_CONCEPT_TILES: u8 = 4;
+pub const SCREEN_CONCEPT_SPEEDO: u8 = 5;
+pub const SCREEN_CONCEPT_INFOCENTER: u8 = 6;
+pub const SCREEN_CONCEPT_TWOCOL: u8 = 7;
+pub const SCREEN_CONCEPT_SPARKLINE: u8 = 8;
+pub const SCREEN_CONCEPT_SIGNAL: u8 = 9;
+pub const SCREEN_CONCEPT_MOOD: u8 = 10;
+/// Highest valid concept id; anything above falls back to the dashboard.
+pub const SCREEN_CONCEPT_MAX: u8 = SCREEN_CONCEPT_MOOD;
 
 pub const SCREEN_BRIGHTNESS_MIN: u8 = 10;
 pub const SCREEN_BRIGHTNESS_MAX: u8 = 100;
@@ -120,7 +143,9 @@ const SCREEN_FLAG_OUTPUT: u8 = 1 << 3;
 
 const STORAGE_MARKER: u8 = 0xE5;
 /// Current record version. Bump together with the layout below.
-const STORAGE_VERSION: u8 = 4;
+const STORAGE_VERSION: u8 = 5;
+/// Version 4 shipped every field except the screen concept (one byte shorter).
+const STORAGE_VERSION_V4: u8 = 4;
 /// Version 3 shared every field except the badge placement (its record is one
 /// byte shorter and is still accepted).
 const STORAGE_VERSION_V3: u8 = 3;
@@ -142,7 +167,10 @@ const LEFT_LABEL_OFFSET: usize = LEFT_LABEL_LEN_OFFSET + 1;
 const RIGHT_LABEL_LEN_OFFSET: usize = LEFT_LABEL_OFFSET + BATTERY_LABEL_MAX;
 const RIGHT_LABEL_OFFSET: usize = RIGHT_LABEL_LEN_OFFSET + 1;
 const PLACE_OFFSET: usize = RIGHT_LABEL_OFFSET + BATTERY_LABEL_MAX;
-pub(crate) const SERIALIZED_LEN: usize = PLACE_OFFSET + 1;
+const CONCEPT_OFFSET: usize = PLACE_OFFSET + 1;
+pub(crate) const SERIALIZED_LEN: usize = CONCEPT_OFFSET + 1;
+/// Length of a version-4 record (same layout without the concept byte).
+const SERIALIZED_LEN_V4: usize = CONCEPT_OFFSET;
 /// Length of a version-3 record (same layout without the placement byte).
 const SERIALIZED_LEN_V3: usize = PLACE_OFFSET;
 
@@ -157,7 +185,7 @@ const _: () = assert!(SERIALIZED_LEN < LEGACY_SERIALIZED_LEN);
 /// Every key the firmware answers. Entropy walks this list with a
 /// "first key greater than the last one" query, so it must stay sorted
 /// ascending.
-const SETTING_KEYS: [u16; 35] = [
+const SETTING_KEYS: [u16; 36] = [
     // Layer names.
     200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215,
     // Qube screen block.
@@ -173,6 +201,7 @@ const SETTING_KEYS: [u16; 35] = [
     QSID_SCREEN_ACCENT_DIM_G,
     QSID_SCREEN_ACCENT_DIM_B,
     QSID_SCREEN_OUTPUT_PLACE,
+    QSID_SCREEN_CONCEPT,
     // Palette settings shared with the Ergohaven LCD numbering.
     QSID_SCREEN_BRIGHTNESS,
     QSID_SCREEN_ACCENT,
@@ -194,6 +223,7 @@ static SCREEN_FLAGS: AtomicU8 = AtomicU8::new(0);
 static SCREEN_HEADER: AtomicU8 = AtomicU8::new(SCREEN_HEADER_BOTH);
 static SCREEN_TIMEOUT: AtomicU8 = AtomicU8::new(0);
 static SCREEN_PLACE: AtomicU8 = AtomicU8::new(SCREEN_OUTPUT_HEADER);
+static SCREEN_CONCEPT: AtomicU8 = AtomicU8::new(SCREEN_CONCEPT_DASHBOARD);
 static SCREEN_BRIGHTNESS: AtomicU8 = AtomicU8::new(SCREEN_BRIGHTNESS_MAX);
 static SCREEN_ACCENT: [AtomicU8; 3] = [
     AtomicU8::new(DEFAULT_ACCENT[0]),
@@ -266,6 +296,8 @@ pub struct ScreenSettings {
     pub output_visible: bool,
     /// Badge placement: [`SCREEN_OUTPUT_HEADER`] or [`SCREEN_OUTPUT_CHIP`].
     pub output_place: u8,
+    /// Screen concept: [`SCREEN_CONCEPT_DASHBOARD`] or `1..=SCREEN_CONCEPT_MAX`.
+    pub concept: u8,
     /// Software dimming of the finished frame, `10..=100`.
     pub brightness: u8,
     pub accent: [u8; 3],
@@ -302,6 +334,7 @@ impl Default for ScreenSettings {
             show_batteries: true,
             output_visible: true,
             output_place: SCREEN_OUTPUT_HEADER,
+            concept: SCREEN_CONCEPT_DASHBOARD,
             brightness: SCREEN_BRIGHTNESS_MAX,
             accent: DEFAULT_ACCENT,
             accent_dim: DEFAULT_ACCENT_DIM,
@@ -368,6 +401,7 @@ pub fn screen_settings() -> ScreenSettings {
         show_batteries: flags & SCREEN_FLAG_BATTERIES != 0,
         output_visible: flags & SCREEN_FLAG_OUTPUT != 0,
         output_place: SCREEN_PLACE.load(Ordering::Relaxed).min(SCREEN_OUTPUT_CHIP),
+        concept: SCREEN_CONCEPT.load(Ordering::Relaxed).min(SCREEN_CONCEPT_MAX),
         brightness: SCREEN_BRIGHTNESS
             .load(Ordering::Relaxed)
             .clamp(SCREEN_BRIGHTNESS_MIN, SCREEN_BRIGHTNESS_MAX),
@@ -421,6 +455,7 @@ pub(crate) fn get_setting(qsid: u16, out: &mut [u8]) -> Option<usize> {
         QSID_SCREEN_BATTERIES => settings.show_batteries as u8,
         QSID_SCREEN_OUTPUT => settings.output_visible as u8,
         QSID_SCREEN_OUTPUT_PLACE => settings.output_place.min(SCREEN_OUTPUT_CHIP),
+        QSID_SCREEN_CONCEPT => settings.concept.min(SCREEN_CONCEPT_MAX),
         QSID_SCREEN_BRIGHTNESS => settings.brightness,
         QSID_SCREEN_ACCENT => settings.accent[0],
         QSID_SCREEN_ACCENT_G => settings.accent[1],
@@ -474,6 +509,7 @@ pub(crate) fn set_setting(qsid: u16, value: &[u8]) -> bool {
         QSID_SCREEN_BATTERIES => update_flags(SCREEN_FLAG_BATTERIES, first != 0),
         QSID_SCREEN_OUTPUT => update_flags(SCREEN_FLAG_OUTPUT, first != 0),
         QSID_SCREEN_OUTPUT_PLACE => store_screen(PLACE_OFFSET, first.min(SCREEN_OUTPUT_CHIP)),
+        QSID_SCREEN_CONCEPT => store_screen(CONCEPT_OFFSET, first.min(SCREEN_CONCEPT_MAX)),
         QSID_SCREEN_HEADER => store_screen(HEADER_OFFSET, first.min(SCREEN_HEADER_BOTH)),
         QSID_SCREEN_TIMEOUT => store_screen(TIMEOUT_OFFSET, first),
         QSID_SCREEN_BRIGHTNESS => {
@@ -579,6 +615,7 @@ pub(crate) fn serialize() -> VialDeviceSettingsData {
     data.data[RIGHT_LABEL_OFFSET..RIGHT_LABEL_OFFSET + BATTERY_LABEL_MAX]
         .copy_from_slice(&settings.right_label.bytes);
     data.data[PLACE_OFFSET] = settings.output_place.min(SCREEN_OUTPUT_CHIP);
+    data.data[CONCEPT_OFFSET] = settings.concept.min(SCREEN_CONCEPT_MAX);
     data
 }
 
@@ -592,11 +629,27 @@ pub(crate) fn deserialize(bytes: &[u8]) {
 
     match (bytes[1], bytes.len()) {
         (STORAGE_VERSION, len) if len >= SERIALIZED_LEN => {
-            store_screen_settings(&stored_screen_settings(bytes, bytes[PLACE_OFFSET]));
+            store_screen_settings(&stored_screen_settings(
+                bytes,
+                bytes[PLACE_OFFSET],
+                bytes[CONCEPT_OFFSET],
+            ));
+        }
+        // Version 4 shipped every screen field except the concept.
+        (STORAGE_VERSION_V4, len) if len >= SERIALIZED_LEN_V4 => {
+            store_screen_settings(&stored_screen_settings(
+                bytes,
+                bytes[PLACE_OFFSET],
+                SCREEN_CONCEPT_DASHBOARD,
+            ));
         }
         // Version 3 shipped every screen field except the badge placement.
         (STORAGE_VERSION_V3, len) if len >= SERIALIZED_LEN_V3 => {
-            store_screen_settings(&stored_screen_settings(bytes, SCREEN_OUTPUT_HEADER));
+            store_screen_settings(&stored_screen_settings(
+                bytes,
+                SCREEN_OUTPUT_HEADER,
+                SCREEN_CONCEPT_DASHBOARD,
+            ));
         }
         (LEGACY_STORAGE_VERSION_V2, len) if len >= LEGACY_SERIALIZED_LEN => {
             read_layer_names(
@@ -623,8 +676,9 @@ pub(crate) fn deserialize(bytes: &[u8]) {
 }
 
 /// Decodes the screen block of a version 3/4 record. The caller passes the
-/// badge placement explicitly, because version 3 has no byte for it.
-fn stored_screen_settings(bytes: &[u8], output_place: u8) -> ScreenSettings {
+/// badge placement and the concept explicitly, because version 3 has no byte
+/// for the placement and version 3/4 have none for the concept.
+fn stored_screen_settings(bytes: &[u8], output_place: u8, concept: u8) -> ScreenSettings {
     read_layer_names(bytes, LAYER_NAMES_OFFSET, LAYER_NAME_MAX, LAYER_NAME_COUNT);
     // A truncated (or empty) screen block must not leak zeros: prefer the
     // factory defaults whenever the stored bytes are missing.
@@ -636,6 +690,7 @@ fn stored_screen_settings(bytes: &[u8], output_place: u8) -> ScreenSettings {
         show_batteries: bytes[FLAGS_OFFSET] & SCREEN_FLAG_BATTERIES != 0,
         output_visible: bytes[FLAGS_OFFSET] & SCREEN_FLAG_OUTPUT != 0,
         output_place: output_place.min(SCREEN_OUTPUT_CHIP),
+        concept: concept.min(SCREEN_CONCEPT_MAX),
         brightness: bytes[BRIGHTNESS_OFFSET].clamp(SCREEN_BRIGHTNESS_MIN, SCREEN_BRIGHTNESS_MAX),
         accent: [
             bytes[ACCENT_OFFSET],
@@ -806,6 +861,7 @@ fn store_screen(offset: usize, value: u8) -> bool {
         HEADER_OFFSET => SCREEN_HEADER.store(value, Ordering::Relaxed),
         TIMEOUT_OFFSET => SCREEN_TIMEOUT.store(value, Ordering::Relaxed),
         PLACE_OFFSET => SCREEN_PLACE.store(value.min(SCREEN_OUTPUT_CHIP), Ordering::Relaxed),
+        CONCEPT_OFFSET => SCREEN_CONCEPT.store(value.min(SCREEN_CONCEPT_MAX), Ordering::Relaxed),
         _ => return false,
     }
     true
@@ -888,6 +944,7 @@ fn store_screen_settings(settings: &ScreenSettings) {
     SCREEN_HEADER.store(settings.header_mode.min(SCREEN_HEADER_BOTH), Ordering::Relaxed);
     SCREEN_TIMEOUT.store(settings.timeout_s, Ordering::Relaxed);
     SCREEN_PLACE.store(settings.output_place.min(SCREEN_OUTPUT_CHIP), Ordering::Relaxed);
+    SCREEN_CONCEPT.store(settings.concept.min(SCREEN_CONCEPT_MAX), Ordering::Relaxed);
     SCREEN_BRIGHTNESS.store(
         settings
             .brightness
