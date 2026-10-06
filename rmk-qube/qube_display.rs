@@ -1586,6 +1586,8 @@ pub struct QubeStatusRenderer {
     wpm_history_head: usize,
     /// Value of the newest sample, so the buffer only moves on a real change.
     last_wpm: u8,
+    /// One debounce per half: the raw split stream wobbles by ±1 pp.
+    battery_smoother: [BatterySmoother; 2],
 }
 
 impl QubeStatusRenderer {
@@ -1599,7 +1601,28 @@ impl QubeStatusRenderer {
             wpm_history: [0; WPM_HISTORY_LEN],
             wpm_history_head: 0,
             last_wpm: 0,
+            battery_smoother: [BatterySmoother::new(), BatterySmoother::new()],
         }
+    }
+
+    /// Debounced battery readings of this frame, one per half. Every consumer
+    /// (dashboard cards, concept digits and their bars) goes through here, so the
+    /// number and the fill can never disagree.
+    fn smoothed_batteries(&mut self, ctx: &RenderContext) -> [BatReading; 2] {
+        let mut out = [BatReading::Unknown; 2];
+        for (index, slot) in out.iter_mut().enumerate() {
+            let raw = battery_reading(ctx.peripheral_batteries.get(index).map(|b| b.0));
+            let percent = match raw {
+                BatReading::Pct(pct) => Some(pct),
+                _ => None,
+            };
+            *slot = match self.battery_smoother[index].update(percent) {
+                Some(pct) => BatReading::Pct(pct),
+                // `--` / `??` / "no data" stay exactly what the event said.
+                None => raw,
+            };
+        }
+        out
     }
 
     /// Records one WPM sample, oldest-first semantics: the ring buffer keeps
@@ -1625,7 +1648,7 @@ impl QubeStatusRenderer {
     /// Everything a concept screen may read, in one owning snapshot: the
     /// buffers live on the stack (no heap), and every flag comes from the same
     /// `ScreenSettings` the dashboard uses.
-    fn concept_state(&self, ctx: &RenderContext, settings: &ScreenSettings) -> ConceptState {
+    fn concept_state(&mut self, ctx: &RenderContext, settings: &ScreenSettings) -> ConceptState {
         let mut name_buf = [0u8; layer_names::LAYER_NAME_MAX];
         let mut name: heapless::String<CONCEPT_NAME_MAX> = heapless::String::new();
         let _ = name.push_str(
@@ -1662,15 +1685,11 @@ impl QubeStatusRenderer {
         };
         let left = ctx.peripherals_connected.first().copied().unwrap_or(false);
         let right = ctx.peripherals_connected.get(1).copied().unwrap_or(false);
+        // Debounced: the halves re-publish a ±1 pp wobbling sample every 2 s.
+        let smoothed = self.smoothed_batteries(ctx);
         let batteries = [
-            (
-                level(battery_reading(ctx.peripheral_batteries.first().map(|b| b.0))),
-                left,
-            ),
-            (
-                level(battery_reading(ctx.peripheral_batteries.get(1).map(|b| b.0))),
-                right,
-            ),
+            (level(smoothed[0]), left),
+            (level(smoothed[1]), right),
         ];
 
         ConceptState {
@@ -1837,8 +1856,10 @@ impl DisplayRenderer<Rgb565> for QubeStatusRenderer {
             .build();
         let left = ctx.peripherals_connected.first().copied().unwrap_or(false);
         let right = ctx.peripherals_connected.get(1).copied().unwrap_or(false);
-        let lp = battery_reading(ctx.peripheral_batteries.first().map(|b| b.0));
-        let rp = battery_reading(ctx.peripheral_batteries.get(1).map(|b| b.0));
+        // Debounced: the raw split stream wobbles by ±1 pp every 2 s.
+        let smoothed = self.smoothed_batteries(ctx);
+        let lp = smoothed[0];
+        let rp = smoothed[1];
         let mut custom_name = [0u8; layer_names::LAYER_NAME_MAX];
         let name = layer_names::copy_layer_name(ctx.layer, &mut custom_name)
             .and_then(|len| core::str::from_utf8(&custom_name[..len]).ok())
@@ -2115,6 +2136,77 @@ fn battery_reading(status: Option<BatteryStatus>) -> BatReading {
         }) => BatReading::Pct(level),
         Some(BatteryStatus::Available { level: None, .. }) => BatReading::Pending,
         Some(BatteryStatus::Unavailable) | None => BatReading::Unknown,
+    }
+}
+
+// --- Battery display smoothing ----------------------------------------------
+//
+// The halves publish a freshly sampled percentage every 2 s and their SAADC
+// runs without `calibrate().await` (see `keyboards/classic_qube/src/battery_nrf.rs`),
+// so the raw value wobbles by ±1 pp around the real level and every event used
+// to repaint the digits. The display therefore averages the last few samples and
+// only follows the average once it is clearly away from what is on the glass.
+//
+// 4 samples ≈ 8 s of history: enough to cut uncorrelated ±1 pp jitter roughly in
+// half (√4), short enough that a real drop is fully shown within one window.
+const BATTERY_WINDOW: usize = 4;
+/// Dead band of the shown value, in tenths of a percent: 15 = 1.5 pp. A wobble
+/// of the average by a couple of tenths never repaints the digit, while a real
+/// 1 pp drift — or the ramp of a bigger drop — still lands.
+const BATTERY_HYSTERESIS_TENTHS: i32 = 15;
+
+/// Debounce of one half's displayed percentage.
+///
+/// `None` means "no usable number right now" — the half is not connected, or it
+/// is connected but has not reported a level yet. Such states pass through
+/// untouched (the renderers draw `--` / `??`), while the history is kept, so the
+/// number comes back smoothly instead of jumping to a stray sample.
+struct BatterySmoother {
+    /// Ring of the last [`BATTERY_WINDOW`] raw samples, one per heartbeat.
+    window: [u8; BATTERY_WINDOW],
+    /// Filled slots; the ring warms up over the first few samples.
+    filled: usize,
+    head: usize,
+    /// Percentage currently on the glass, `None` while a half shows `--`/`??`.
+    shown: Option<u8>,
+}
+
+impl BatterySmoother {
+    const fn new() -> Self {
+        Self {
+            window: [0; BATTERY_WINDOW],
+            filled: 0,
+            head: 0,
+            shown: None,
+        }
+    }
+
+    fn update(&mut self, reading: Option<u8>) -> Option<u8> {
+        let Some(value) = reading else {
+            // "no data" / "??": keep the history, report "no number".
+            return None;
+        };
+
+        self.window[self.head] = value;
+        self.head = (self.head + 1) % BATTERY_WINDOW;
+        if self.filled < BATTERY_WINDOW {
+            self.filled += 1;
+        }
+
+        let sum: u32 = self.window[..self.filled].iter().map(|v| u32::from(*v)).sum();
+        let average_tenths = (sum * 10 / self.filled as u32).min(1000) as i32;
+
+        match self.shown {
+            // First number after power-up or after a `--`/`??` stretch: show it,
+            // no need to wait for a full window.
+            None => self.shown = Some((average_tenths / 10) as u8),
+            Some(shown) => {
+                if (average_tenths - i32::from(shown) * 10).abs() >= BATTERY_HYSTERESIS_TENTHS {
+                    self.shown = Some((average_tenths / 10) as u8);
+                }
+            }
+        }
+        self.shown
     }
 }
 
