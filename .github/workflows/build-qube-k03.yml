@@ -1,0 +1,141 @@
+name: Build K:03 Qube (RMK) firmware
+
+# Повторяет job build-qube из ergohaven/rmk (коммит c84a649f) и собирает
+# три файла для K:03: донгл Qube + левая и правая половины.
+# Профиль K:03 берётся из rmk-qube/keyboard_k03.toml этого репозитория
+# (там сверху слева переключатель раскладки: Left Alt + Left Shift).
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'rmk-qube/**'
+      - '.github/workflows/build-qube-k03.yml'
+
+env:
+  RMK_REPO: ergohaven/rmk
+  RMK_REV: c84a649f6871de0b14a97ebf1400efc559f51d5d
+  OUTPUT_NAME: k03_qube
+
+jobs:
+  build-k03-qube:
+    name: Build k03_qube firmware
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout this config repo
+        uses: actions/checkout@v4
+
+      - name: Checkout RMK sources (pinned revision)
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.RMK_REPO }}
+          ref: ${{ env.RMK_REV }}
+          path: rmk-src
+
+      - name: Apply K:03 Qube profile from this repo
+        run: |
+          cp -v rmk-qube/keyboard_k03.toml rmk-src/keyboards/classic_qube/keyboard_k03.toml
+
+      - name: Install ARM toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends gcc-arm-none-eabi binutils-arm-none-eabi libnewlib-arm-none-eabi clang libclang-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: thumbv7em-none-eabihf
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: ${{ runner.os }}-cargo-classic_qube-${{ hashFiles('rmk-src/keyboards/classic_qube/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-classic_qube-
+            ${{ runner.os }}-cargo-
+
+      - name: Install flip-link
+        run: cargo install flip-link --locked
+
+      - name: Download uf2conv script
+        run: |
+          for i in 1 2 3 4 5; do
+            curl -fL --retry 3 --retry-delay 5 \
+              https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2conv.py \
+              -o uf2conv.py && break || sleep 10
+          done
+          for i in 1 2 3; do
+            curl -fL --retry 3 --retry-delay 5 \
+              https://raw.githubusercontent.com/microsoft/uf2/master/utils/uf2families.json \
+              -o uf2families.json && break || sleep 10
+          done
+          python3 -c "import ast; ast.parse(open('uf2conv.py').read())" || { echo "uf2conv.py invalid"; exit 1; }
+
+      - name: Build Qube dongle
+        working-directory: rmk-src/keyboards/classic_qube
+        env:
+          BINDGEN_EXTRA_CLANG_ARGS: "--sysroot=/usr/lib/arm-none-eabi --target=arm-none-eabi -I/usr/lib/arm-none-eabi/include -I/usr/lib/gcc/arm-none-eabi/13.2.1/include"
+          CARGO_TARGET_DIR: target/${{ env.OUTPUT_NAME }}/qube
+          KEYBOARD_TOML_PATH: ${{ github.workspace }}/rmk-src/keyboards/classic_qube/keyboard_k03.toml
+          RUST_MIN_STACK: "33554432"
+          VIAL_JSON_PATH: ${{ github.workspace }}/rmk-src/keyboards/k03/vial.json
+        run: cargo build --release --bin qube --no-default-features --features qube
+
+      - name: Build left half
+        working-directory: rmk-src/keyboards/classic_qube
+        env:
+          BINDGEN_EXTRA_CLANG_ARGS: "--sysroot=/usr/lib/arm-none-eabi --target=arm-none-eabi -I/usr/lib/arm-none-eabi/include -I/usr/lib/gcc/arm-none-eabi/13.2.1/include"
+          CARGO_TARGET_DIR: target/${{ env.OUTPUT_NAME }}/halves
+          KEYBOARD_TOML_PATH: ${{ github.workspace }}/rmk-src/keyboards/classic_qube/keyboard_k03.toml
+          RUST_MIN_STACK: "33554432"
+          VIAL_JSON_PATH: ${{ github.workspace }}/rmk-src/keyboards/k03/vial.json
+        run: cargo build --release --bin left
+
+      - name: Build right half
+        working-directory: rmk-src/keyboards/classic_qube
+        env:
+          BINDGEN_EXTRA_CLANG_ARGS: "--sysroot=/usr/lib/arm-none-eabi --target=arm-none-eabi -I/usr/lib/arm-none-eabi/include -I/usr/lib/gcc/arm-none-eabi/13.2.1/include"
+          CARGO_TARGET_DIR: target/${{ env.OUTPUT_NAME }}/halves
+          KEYBOARD_TOML_PATH: ${{ github.workspace }}/rmk-src/keyboards/classic_qube/keyboard_k03.toml
+          RUST_MIN_STACK: "33554432"
+          VIAL_JSON_PATH: ${{ github.workspace }}/rmk-src/keyboards/k03/vial.json
+        run: cargo build --release --bin right
+
+      - name: Convert to UF2
+        working-directory: ${{ github.workspace }}
+        run: |
+          TARGET="rmk-src/keyboards/classic_qube/target/${OUTPUT_NAME}"
+
+          arm-none-eabi-objcopy -O binary \
+            "$TARGET/qube/thumbv7em-none-eabihf/release/qube" qube.bin
+          python3 uf2conv.py qube.bin \
+            --base 0x1000 --family 0xADA52840 \
+            --output ${OUTPUT_NAME}_dongle.uf2
+
+          arm-none-eabi-objcopy -O binary \
+            "$TARGET/halves/thumbv7em-none-eabihf/release/left" left.bin
+          python3 uf2conv.py left.bin \
+            --base 0x26000 --family 0xADA52840 \
+            --output ${OUTPUT_NAME}_left.uf2
+
+          arm-none-eabi-objcopy -O binary \
+            "$TARGET/halves/thumbv7em-none-eabihf/release/right" right.bin
+          python3 uf2conv.py right.bin \
+            --base 0x26000 --family 0xADA52840 \
+            --output ${OUTPUT_NAME}_right.uf2
+
+          ls -l *.uf2
+
+      - name: Upload firmware
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.OUTPUT_NAME }}
+          path: |
+            ${{ env.OUTPUT_NAME }}_dongle.uf2
+            ${{ env.OUTPUT_NAME }}_left.uf2
+            ${{ env.OUTPUT_NAME }}_right.uf2
+          retention-days: 30
