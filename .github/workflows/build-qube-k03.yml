@@ -4,6 +4,8 @@ name: Build K:03 Qube (RMK) firmware
 # три файла для K:03: донгл Qube + левая и правая половины.
 # Профиль K:03 берётся из rmk-qube/keyboard_k03.toml этого репозитория
 # (там сверху слева переключатель раскладки: Left Alt + Left Shift).
+# Экран Qube берётся из rmk-qube/qube_display.rs этого репозитория
+# (сплеш при включении, крупный шрифт, индикатор WPM).
 
 on:
   workflow_dispatch:
@@ -36,6 +38,7 @@ jobs:
       - name: Apply K:03 Qube profile from this repo
         run: |
           cp -v rmk-qube/keyboard_k03.toml rmk-src/keyboards/classic_qube/keyboard_k03.toml
+          cp -v rmk-qube/qube_display.rs rmk-src/keyboards/classic_qube/src/qube_display.rs
 
       - name: Install ARM toolchain
         run: |
