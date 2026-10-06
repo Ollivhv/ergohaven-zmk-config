@@ -126,6 +126,10 @@ const LAYOUT_GAP_HEADER: i32 = 4;
 const LAYOUT_GAP: i32 = 6;
 
 fn compute_layout(settings: &ScreenSettings) -> Layout {
+    let header = Band {
+        y: LAYOUT_TOP,
+        h: LAYOUT_HEADER_H,
+    };
     let mut reserve = 0i32;
     if settings.show_modifiers {
         reserve += LAYOUT_GAP + LAYOUT_MODS_H as i32;
@@ -134,10 +138,6 @@ fn compute_layout(settings: &ScreenSettings) -> Layout {
         reserve += LAYOUT_GAP + LAYOUT_BAT_H as i32;
     }
 
-    let header = Band {
-        y: LAYOUT_TOP,
-        h: LAYOUT_HEADER_H,
-    };
     let row_top = header.bottom() + LAYOUT_GAP_HEADER;
     let row_h = ((SCREEN_H as i32 - LAYOUT_BOTTOM_MARGIN) - reserve - row_top)
         .max(LAYOUT_ROW_MIN_H as i32);
@@ -423,6 +423,33 @@ impl Look {
     }
 }
 
+/// Rewrites one RGB565 pixel: the three palette entries the UI draws with are
+/// replaced by the configured colours, every component is scaled by the
+/// brightness setting, and a blanked screen becomes black. The panel driver
+/// applies this to each finished stripe.
+fn look_pixel(raw: u16, look: &Look) -> u16 {
+    if look.blank {
+        return 0;
+    }
+    let mut raw = if raw == COL_ACCENT_RAW {
+        look.accent.into_storage()
+    } else if raw == COL_ACCENT_DIM_RAW {
+        look.accent_dim.into_storage()
+    } else if raw == COL_BG_RAW {
+        look.background.into_storage()
+    } else {
+        raw
+    };
+    let scale = look.brightness.min(SCREEN_BRIGHTNESS_MAX) as u32;
+    if scale < SCREEN_BRIGHTNESS_MAX as u32 {
+        let r5 = ((raw >> 11) & 0x1F) as u32 * scale / 100;
+        let g6 = ((raw >> 5) & 0x3F) as u32 * scale / 100;
+        let b5 = (raw & 0x1F) as u32 * scale / 100;
+        raw = ((r5 as u16) << 11) | ((g6 as u16) << 5) | b5 as u16;
+    }
+    raw
+}
+
 // --- Boot splash ------------------------------------------------------------
 
 
@@ -633,31 +660,9 @@ impl StripeLcd {
     /// costs one pass over ≤ 26 880 bytes per stripe.
     fn apply_look(&mut self, look: &Look) {
         let bytes = SCREEN_W * self.band_h as usize * 2;
-        let accent = look.accent.into_storage();
-        let accent_dim = look.accent_dim.into_storage();
-        let background = look.background.into_storage();
-        let scale = look.brightness.min(SCREEN_BRIGHTNESS_MAX) as u32;
         for pix in self.buffer[..bytes].chunks_exact_mut(2) {
-            if look.blank {
-                pix[0] = 0;
-                pix[1] = 0;
-                continue;
-            }
-            let mut raw = ((pix[0] as u16) << 8) | pix[1] as u16;
-            if raw == COL_ACCENT_RAW {
-                raw = accent;
-            } else if raw == COL_ACCENT_DIM_RAW {
-                raw = accent_dim;
-            } else if raw == COL_BG_RAW {
-                raw = background;
-            }
-            if scale < SCREEN_BRIGHTNESS_MAX as u32 {
-                let r5 = ((raw >> 11) & 0x1F) as u32 * scale / 100;
-                let g6 = ((raw >> 5) & 0x3F) as u32 * scale / 100;
-                let b5 = (raw & 0x1F) as u32 * scale / 100;
-                raw = ((r5 as u16) << 11) | ((g6 as u16) << 5) | b5 as u16;
-            }
-            let out = raw.to_be_bytes();
+            let raw = ((pix[0] as u16) << 8) | pix[1] as u16;
+            let out = look_pixel(raw, look).to_be_bytes();
             pix[0] = out[0];
             pix[1] = out[1];
         }
