@@ -195,8 +195,11 @@ pub const SCREEN_CONCEPT_TWOCOL: u8 = 7;
 pub const SCREEN_CONCEPT_SPARKLINE: u8 = 8;
 pub const SCREEN_CONCEPT_SIGNAL: u8 = 9;
 pub const SCREEN_CONCEPT_MOOD: u8 = 10;
+pub const SCREEN_CONCEPT_BATTILES: u8 = 11;
+pub const SCREEN_CONCEPT_MEDIACENTER: u8 = 12;
+pub const SCREEN_CONCEPT_BOARD: u8 = 13;
 /// Highest valid concept id; anything above falls back to the dashboard.
-pub const SCREEN_CONCEPT_MAX: u8 = SCREEN_CONCEPT_MOOD;
+pub const SCREEN_CONCEPT_MAX: u8 = SCREEN_CONCEPT_BOARD;
 
 pub const SCREEN_BRIGHTNESS_MIN: u8 = 10;
 pub const SCREEN_BRIGHTNESS_MAX: u8 = 100;

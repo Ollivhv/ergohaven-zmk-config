@@ -76,7 +76,10 @@
                         "Two-column",
                         "Sparkline",
                         "Signal",
-                        "Mood"
+                        "Mood",
+                        "Battery tiles",
+                        "Media center",
+                        "Board"
                     ]
                 },
                 { "type": "integer", "title": "Panel color R", "qsid": 230, "min": 0, "max": 255, "width": 1 },

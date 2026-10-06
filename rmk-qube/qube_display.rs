@@ -62,7 +62,8 @@ use static_cell::StaticCell;
 use crate::layer_names::{
     self, ScreenSettings, BATTERY_LABEL_MAX, SCREEN_BRIGHTNESS_MAX, SCREEN_HEADER_CLOCK,
     SCREEN_HEADER_MEDIA,
-    SCREEN_CONCEPT_DASHBOARD, SCREEN_CONCEPT_HUD, SCREEN_CONCEPT_INFOCENTER, SCREEN_CONCEPT_MAX,
+    SCREEN_CONCEPT_BATTILES, SCREEN_CONCEPT_BOARD, SCREEN_CONCEPT_DASHBOARD, SCREEN_CONCEPT_HUD,
+    SCREEN_CONCEPT_INFOCENTER, SCREEN_CONCEPT_MAX, SCREEN_CONCEPT_MEDIACENTER,
     SCREEN_CONCEPT_MINIMAL, SCREEN_CONCEPT_MOOD, SCREEN_CONCEPT_SIGNAL, SCREEN_CONCEPT_SPARKLINE,
     SCREEN_CONCEPT_SPEEDO, SCREEN_CONCEPT_TERMINAL, SCREEN_CONCEPT_TILES, SCREEN_CONCEPT_TWOCOL,
     SCREEN_OUTPUT_CHIP, SCREEN_OUTPUT_HEADER,
@@ -2698,6 +2699,9 @@ pub const WPM_HISTORY_LEN: usize = 24;
 /// Layer-name buffer of a concept: the blob caps a name at 10 bytes, the stand's
 /// mock used 12.
 const CONCEPT_NAME_MAX: usize = 16;
+/// Buffer of `fit_name`: it also fits media titles (a 31-character title is
+/// truncated to 24 glyphs by the caller's pixel budget).
+const CONCEPT_FIT_MAX: usize = 40;
 /// Media buffer of a concept: `artist - title`, the dashboard's budget.
 const CONCEPT_MEDIA_MAX: usize = 72;
 
@@ -3054,8 +3058,8 @@ fn bat_line<D: DrawTarget<Color = Rgb565>>(d: &mut D, x: i32, y: i32, st: &Conce
 }
 
 /// Fit a layer name into `avail` px: 2x, else 1x, else 1x with `..`.
-fn fit_name(name: &str, avail: i32) -> (heapless::String<CONCEPT_NAME_MAX>, u32) {
-    let mut out: heapless::String<CONCEPT_NAME_MAX> = heapless::String::new();
+fn fit_name(name: &str, avail: i32) -> (heapless::String<CONCEPT_FIT_MAX>, u32) {
+    let mut out: heapless::String<CONCEPT_FIT_MAX> = heapless::String::new();
     let len = name.chars().count() as i32;
     if 2 * 10 * len <= avail {
         let _ = out.push_str(name);
@@ -3127,6 +3131,9 @@ fn render_concept<D: DrawTarget<Color = Rgb565>>(display: &mut D, concept: u8, s
         SCREEN_CONCEPT_SPARKLINE => render_concept_sparkline(display, st),
         SCREEN_CONCEPT_SIGNAL => render_concept_signal(display, st),
         SCREEN_CONCEPT_MOOD => render_concept_mood(display, st),
+        SCREEN_CONCEPT_BATTILES => render_concept_battiles(display, st),
+        SCREEN_CONCEPT_MEDIACENTER => render_concept_mediacenter(display, st),
+        SCREEN_CONCEPT_BOARD => render_concept_board(display, st),
         _ => {}
     }
 }
@@ -3871,5 +3878,327 @@ fn render_concept_mood<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptSta
     }
     if st.show_clock {
         ctext6r(d, &st.time(), 240, 210, C_DIM);
+    }
+}
+
+// --- round two: battery tiles, media centre, board --------------------------
+//
+// Ported from the second preview round (`work/qube-preview/src/concepts2.rs`).
+// The stand passed a palette struct around; here the same roles are drawn with
+// the factory constants and the panel post-pass (`look_pixel`) turns them into
+// the configured colours, which is what makes the light theme work on these
+// screens too. The only deliberate difference from the mocks: the host protocol
+// carries no track position, so the progress bars are not drawn at all.
+
+/// Battery colour of the second round: "good" is the bar/scale colour.
+fn pbat_color(level: Option<u8>) -> Rgb565 {
+    match level {
+        Some(value) if value < 10 => C_BAD,
+        Some(value) if value < 25 => C_WARN,
+        Some(_) => COL_BAR_FG,
+        None => C_DIM,
+    }
+}
+
+/// Badge of the second round: a taller dot than [`badge_line`].
+fn pbadge<D: DrawTarget<Color = Rgb565>>(d: &mut D, x: i32, y: i32, st: &ConceptState) {
+    let (text, color) = st.badge();
+    cfill(d, x, y + 2, 4, 8, color);
+    ctext6(d, &text, x + 8, y, C_INK);
+}
+
+/// `L 73%  R 41%` with the second round's spacing.
+fn pbat_line<D: DrawTarget<Color = Rgb565>>(d: &mut D, x: i32, y: i32, st: &ConceptState) {
+    for index in 0..2 {
+        let (level, connected) = st.bat(index);
+        let side = st.side(index);
+        let mut value: heapless::String<8> = heapless::String::new();
+        if !connected {
+            let _ = value.push_str("--");
+        } else if let Some(pct) = level {
+            let _ = write!(&mut value, "{}%", pct);
+        } else {
+            let _ = value.push_str("??");
+        }
+        ctext6(d, &side, x + index as i32 * 40, y, C_DIM);
+        ctext6(d, &value, x + 9 + index as i32 * 40, y, pbat_color(level));
+    }
+}
+
+/// `ctrl shift …` (or `none`) in one line of `FONT_6X10`.
+fn concept_mods_text(st: &ConceptState) -> heapless::String<24> {
+    let mut out: heapless::String<24> = heapless::String::new();
+    if st.mods & 0x03 != 0 {
+        let _ = out.push_str("ctrl ");
+    }
+    if st.mods & 0x0C != 0 {
+        let _ = out.push_str("shift ");
+    }
+    if st.mods & 0x30 != 0 {
+        let _ = out.push_str("alt ");
+    }
+    if st.mods & 0xC0 != 0 {
+        let _ = out.push_str("gui ");
+    }
+    if st.caps_lock {
+        let _ = out.push_str("caps ");
+    }
+    if st.num_lock {
+        let _ = out.push_str("num ");
+    }
+    if out.is_empty() {
+        let _ = out.push_str("none");
+    } else {
+        let len = out.trim_end().len();
+        out.truncate(len);
+    }
+    out
+}
+
+/// `"artist - title"` → `(artist, title)`; the separator is what the dashboard
+/// uses when it builds the line.
+fn media_split(media: &str) -> (&str, &str) {
+    match media.find(" - ") {
+        Some(index) => (&media[..index], &media[index + 3..]),
+        None => ("", media),
+    }
+}
+
+/// 11. Battery tiles: the charge of both halves in two big tiles.
+fn render_concept_battiles<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptState) {
+    let _ = d.clear(C_BG);
+    let (name, _) = fit_name(st.name.as_str(), 120);
+    ctext6(d, &name, 16, 14, C_INK);
+    if st.show_wpm {
+        let mut wpm: heapless::String<16> = heapless::String::new();
+        let _ = write!(&mut wpm, "{} wpm", st.wpm);
+        ctext6c(d, &wpm, 140, 14, C_ACCENT);
+    }
+    if st.show_output {
+        pbadge(d, 226, 14, st);
+    }
+
+    for index in 0..2 {
+        let x = if index == 0 { 16 } else { 148 };
+        cframe(d, x, 40, 116, 128, C_PANEL, C_BORDER);
+        ctext6(d, st.label(index), x + 10, 50, C_DIM);
+        let (level, connected) = st.bat(index);
+        let mut value: heapless::String<16> = heapless::String::new();
+        if !connected {
+            let _ = value.push_str("--");
+        } else if let Some(pct) = level {
+            let _ = write!(&mut value, "{}%", pct);
+        } else {
+            let _ = value.push_str("??");
+        }
+        if st.show_batteries {
+            // ×2: even "100%" is 80 px inside a 116 px tile.
+            ctext20(
+                d,
+                &value,
+                x + 58,
+                70,
+                pbat_color(level),
+                Alignment::Center,
+                2,
+            );
+            cbar(
+                d,
+                x + 12,
+                132,
+                92,
+                16,
+                if connected { level.unwrap_or(0) as u32 } else { 0 },
+                pbat_color(level),
+            );
+            ctext6(
+                d,
+                if connected { "connected" } else { "no link" },
+                x + 12,
+                152,
+                C_DIM,
+            );
+        }
+    }
+
+    cfill(d, 16, 176, 248, 2, C_BORDER);
+    if st.show_modifiers {
+        cmods(d, 16, 186, st);
+        ctext6(d, &concept_mods_text(st), 16, 206, C_DIM);
+    }
+    if st.show_clock {
+        ctext6r(d, &st.time(), 264, 186, C_DIM);
+    }
+    if st.show_output {
+        ctext6r(d, link_words(st.link), 264, 206, C_ACCENT);
+    }
+}
+
+/// 12. Media centre: the track title large, with the state in the footer.
+fn render_concept_mediacenter<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptState) {
+    let _ = d.clear(C_BG);
+    ctext6(d, "NOW PLAYING", 20, 18, C_DIM);
+    cfill(d, 20, 32, 40, 2, C_ACCENT);
+
+    let (artist, title) = media_split(st.media.as_str());
+    let mut line: heapless::String<40> = heapless::String::new();
+    if !st.show_media {
+        // Media hidden by the header setting: the centre carries the clock.
+        if st.show_clock {
+            ctext20(
+                d,
+                &st.time(),
+                140,
+                60,
+                C_INK,
+                Alignment::Center,
+                2,
+            );
+        }
+    } else {
+        if st.media.is_empty() {
+            let _ = line.push_str("nothing playing");
+        } else {
+            let _ = line.push_str(title);
+        }
+        let (fitted, scale) = fit_name(&line, 240);
+        ctext20(
+            d,
+            &fitted,
+            140,
+            scale_y(scale, 54),
+            C_INK,
+            Alignment::Center,
+            scale,
+        );
+        if !artist.is_empty() && artist != title {
+            ctext8c(d, &clipped::<36>(artist, 30), 140, 116, C_DIM);
+        }
+    }
+
+    // No progress bar: the host protocol carries no track position
+    // (`rmk::host_data::HostData` has hour/minute and the media text only).
+    if st.show_clock && st.show_media {
+        ctext6(d, &st.time(), 20, 160, C_DIM);
+    }
+
+    cfill(d, 20, 188, 240, 2, C_BORDER);
+    let (name, _) = fit_name(st.name.as_str(), 120);
+    ctext6(d, &name, 20, 198, C_INK);
+    if st.show_wpm {
+        let mut wpm: heapless::String<16> = heapless::String::new();
+        let _ = write!(&mut wpm, "{} wpm", st.wpm);
+        ctext6(d, &wpm, 150, 198, C_ACCENT);
+    }
+    if st.show_output {
+        pbadge(d, 20, 216, st);
+    }
+    if st.show_batteries {
+        pbat_line(d, 150, 216, st);
+    }
+}
+
+/// 13. Board: the two halves as tiles on top, the "phone" with the track below.
+fn render_concept_board<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptState) {
+    let _ = d.clear(C_BG);
+    for index in 0..2 {
+        let x = if index == 0 { 16 } else { 148 };
+        cframe(d, x, 12, 116, 68, C_PANEL, C_BORDER);
+        ctext6(
+            d,
+            if index == 0 { "LEFT" } else { "RIGHT" },
+            x + 10,
+            20,
+            C_DIM,
+        );
+        let (level, connected) = st.bat(index);
+        let mut value: heapless::String<16> = heapless::String::new();
+        if !connected {
+            let _ = value.push_str("--");
+        } else if let Some(pct) = level {
+            let _ = write!(&mut value, "{}%", pct);
+        } else {
+            let _ = value.push_str("??");
+        }
+        if st.show_batteries {
+            ctext20(
+                d,
+                &value,
+                x + 58,
+                36,
+                pbat_color(level),
+                Alignment::Center,
+                1,
+            );
+            cbar(
+                d,
+                x + 10,
+                62,
+                96,
+                10,
+                if connected { level.unwrap_or(0) as u32 } else { 0 },
+                pbat_color(level),
+            );
+        }
+    }
+    cfill(d, 132, 40, 16, 4, C_BORDER);
+    cfill(d, 132, 52, 16, 4, C_BORDER);
+
+    let mut layer_no: heapless::String<8> = heapless::String::new();
+    let _ = write!(&mut layer_no, "L{}", st.layer);
+    ctext6(d, &layer_no, 16, 90, C_DIM);
+    let (name, _) = fit_name(st.name.as_str(), 140);
+    ctext6(d, &name, 44, 90, C_INK);
+    if st.show_wpm {
+        let mut wpm: heapless::String<16> = heapless::String::new();
+        let _ = write!(&mut wpm, "{} wpm", st.wpm);
+        ctext6r(d, &wpm, 264, 90, C_ACCENT);
+    }
+    if st.show_output {
+        pbadge(d, 16, 106, st);
+        ctext6r(d, link_words(st.link), 264, 106, C_DIM);
+    }
+    if st.show_modifiers {
+        cmods(d, 110, 106, st);
+    }
+
+    cframe(d, 24, 130, 232, 96, C_PANEL, C_BORDER);
+    ctext6(d, "PHONE / NOW PLAYING", 34, 138, C_DIM);
+    let (artist, title) = media_split(st.media.as_str());
+    if st.show_media {
+        let mut line: heapless::String<40> = heapless::String::new();
+        if st.media.is_empty() {
+            // The mock leaves the phone panel title empty when nothing plays.
+        } else {
+            let _ = line.push_str(title);
+        }
+        let (fitted, scale) = fit_name(&line, 200);
+        ctext20(
+            d,
+            &fitted,
+            140,
+            scale_y(scale, 154),
+            C_INK,
+            Alignment::Center,
+            scale,
+        );
+        // No progress bar: the host sends no track position. The line under the
+        // title carries the artist (left) and the clock (right) instead.
+        if !artist.is_empty() {
+            ctext6(d, &clipped::<36>(artist, 26), 36, 210, C_DIM);
+        }
+        if st.show_clock {
+            ctext6r(d, &st.time(), 244, 210, C_DIM);
+        }
+    } else if st.show_clock {
+        ctext20(
+            d,
+            &st.time(),
+            140,
+            160,
+            C_INK,
+            Alignment::Center,
+            2,
+        );
     }
 }
