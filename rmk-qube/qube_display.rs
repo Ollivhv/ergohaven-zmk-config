@@ -60,8 +60,8 @@ use rmk_types::connection::{ConnectionStatus, ConnectionType};
 use static_cell::StaticCell;
 
 use crate::layer_names::{
-    self, ScreenSettings, BATTERY_LABEL_MAX, DEFAULT_ACCENT, DEFAULT_ACCENT_DIM,
-    DEFAULT_BACKGROUND, SCREEN_BRIGHTNESS_MAX, SCREEN_HEADER_CLOCK, SCREEN_HEADER_MEDIA,
+    self, ScreenSettings, BATTERY_LABEL_MAX, SCREEN_BRIGHTNESS_MAX, SCREEN_HEADER_CLOCK,
+    SCREEN_HEADER_MEDIA,
     SCREEN_CONCEPT_DASHBOARD, SCREEN_CONCEPT_HUD, SCREEN_CONCEPT_INFOCENTER, SCREEN_CONCEPT_MAX,
     SCREEN_CONCEPT_MINIMAL, SCREEN_CONCEPT_MOOD, SCREEN_CONCEPT_SIGNAL, SCREEN_CONCEPT_SPARKLINE,
     SCREEN_CONCEPT_SPEEDO, SCREEN_CONCEPT_TERMINAL, SCREEN_CONCEPT_TILES, SCREEN_CONCEPT_TWOCOL,
@@ -308,28 +308,210 @@ const COL_PANEL_HI: Rgb565 = Rgb565::new(3, 9, 13);
 const COL_BORDER: Rgb565 = Rgb565::new(5, 13, 16);
 const COL_BORDER_DIM: Rgb565 = Rgb565::new(3, 8, 11);
 
-// --- Settings-driven look ---------------------------------------------------
+// --- Runtime palette --------------------------------------------------------
+//
+// The UI keeps drawing with the constants below. The panel post-pass then
+// rewrites every pixel whose value is one of those constants into the colour
+// configured for that role (`QSID 224..250` / `320..332`), so:
+//
+// * a device that never stored colours paints exactly the previous frame — the
+//   factory palette is the identity (asserted at compile time below and checked
+//   frame by frame in the host harness);
+// * a configured palette recolours the dashboard *and* every concept, because
+//   the substitution happens on the finished stripe.
+//
+// Roles the colour settings do not name directly (the lighter panel shade, the
+// dimmer caption, the "good" green of the battery and the connection badge …)
+// are the configured base colour shifted per channel by the exact offset the two
+// factory constants had. Offsets keep the family relationships sensible for a
+// custom palette and reproduce the factory one bit for bit.
 
-/// Raw RGB565 of the pre-settings palette entries. `DEFAULT_*` from
-/// `layer_names` are the 8-bit expansions of exactly these values, so the
-/// factory settings rebuild the original colours (checked at compile time).
-const COL_ACCENT_RAW: u16 = (3 << 11) | (38 << 5) | 31;
-const COL_ACCENT_DIM_RAW: u16 = (1 << 11) | (16 << 5) | 18;
-const COL_BG_RAW: u16 = (2 << 5) | 4;
-
-const fn rgb8_to_raw565(color: [u8; 3]) -> u16 {
-    (((color[0] >> 3) as u16) << 11)
-        | (((color[1] >> 2) as u16) << 5)
-        | ((color[2] >> 3) as u16)
+/// Raw RGB565 of a colour, available at compile time (`Rgb565::into_storage` is
+/// not a `const fn` in embedded-graphics 0.8).
+const fn raw565(r: u8, g: u8, b: u8) -> u16 {
+    ((r as u16 & 0x1F) << 11) | ((g as u16 & 0x3F) << 5) | (b as u16 & 0x1F)
 }
 
-const _: () = assert!(rgb8_to_raw565(DEFAULT_ACCENT) == COL_ACCENT_RAW);
-const _: () = assert!(rgb8_to_raw565(DEFAULT_ACCENT_DIM) == COL_ACCENT_DIM_RAW);
-const _: () = assert!(rgb8_to_raw565(DEFAULT_BACKGROUND) == COL_BG_RAW);
+/// Raw RGB565 of every factory colour the UI draws with, in the same order the
+/// constants are declared above.
+const COL_BG_RAW: u16 = raw565(0, 2, 4);
+const COL_PANEL_RAW: u16 = raw565(2, 6, 9);
+const COL_PANEL_HI_RAW: u16 = raw565(3, 9, 13);
+const COL_BORDER_RAW: u16 = raw565(5, 13, 16);
+const COL_BORDER_DIM_RAW: u16 = raw565(3, 8, 11);
+const COL_FG_RAW: u16 = raw565(29, 61, 30);
+const COL_MUTED_RAW: u16 = raw565(11, 24, 20);
+const COL_LABEL_RAW: u16 = raw565(16, 36, 28);
+const COL_DIM_RAW: u16 = raw565(5, 12, 14);
+const COL_ACCENT_RAW: u16 = raw565(3, 38, 31);
+const COL_ACCENT_DIM_RAW: u16 = raw565(1, 16, 18);
+const COL_YELLOW_RAW: u16 = raw565(31, 50, 0);
+const COL_RED_RAW: u16 = raw565(31, 5, 5);
+const COL_BAR_BG_RAW: u16 = raw565(2, 7, 9);
+const COL_BAR_FG_RAW: u16 = raw565(3, 42, 30);
+const COL_OUTPUT_OK_RAW: u16 = raw565(4, 46, 12);
+const COL_OUTPUT_SEARCH_RAW: u16 = raw565(4, 24, 31);
+const C_OK_RAW: u16 = raw565(6, 50, 10);
+const C_TERM_RAW: u16 = raw565(4, 56, 10);
 
-fn rgb565_from_rgb8(color: [u8; 3]) -> Rgb565 {
-    Rgb565::new(color[0] >> 3, color[1] >> 2, color[2] >> 3)
+const fn clamp_channel(value: i32, max: i32) -> u16 {
+    (if value < 0 {
+        0
+    } else if value > max {
+        max
+    } else {
+        value
+    }) as u16
 }
+
+/// Shifts every channel of `raw` by `offset`, saturating at the 5/6/5 limits.
+const fn shift_raw(raw: u16, offset: (i8, i8, i8)) -> u16 {
+    let r = clamp_channel(((raw >> 11) & 0x1F) as i32 + offset.0 as i32, 31);
+    let g = clamp_channel(((raw >> 5) & 0x3F) as i32 + offset.1 as i32, 63);
+    let b = clamp_channel((raw & 0x1F) as i32 + offset.2 as i32, 31);
+    (r << 11) | (g << 5) | b
+}
+
+/// Per-channel difference between two factory colours: the shade offsets below
+/// are read off the old palette, so nothing is hand-tuned twice.
+const fn shift_of(base: u16, target: u16) -> (i8, i8, i8) {
+    (
+        (((target >> 11) & 0x1F) as i32 - ((base >> 11) & 0x1F) as i32) as i8,
+        (((target >> 5) & 0x3F) as i32 - ((base >> 5) & 0x3F) as i32) as i8,
+        ((target & 0x1F) as i32 - (base & 0x1F) as i32) as i8,
+    )
+}
+
+const PANEL_HI_OFFSET: (i8, i8, i8) = shift_of(COL_PANEL_RAW, COL_PANEL_HI_RAW);
+const BORDER_DIM_OFFSET: (i8, i8, i8) = shift_of(COL_BORDER_RAW, COL_BORDER_DIM_RAW);
+const LABEL_HI_OFFSET: (i8, i8, i8) = shift_of(COL_MUTED_RAW, COL_LABEL_RAW);
+const LABEL_DIM_OFFSET: (i8, i8, i8) = shift_of(COL_MUTED_RAW, COL_DIM_RAW);
+const BAR_BG_OFFSET: (i8, i8, i8) = shift_of(COL_PANEL_RAW, COL_BAR_BG_RAW);
+const BATTERY_OK_OFFSET: (i8, i8, i8) = shift_of(COL_BAR_FG_RAW, C_OK_RAW);
+const OUTPUT_OK_OFFSET: (i8, i8, i8) = shift_of(COL_BAR_FG_RAW, COL_OUTPUT_OK_RAW);
+const OUTPUT_SEARCH_OFFSET: (i8, i8, i8) = shift_of(COL_ACCENT_RAW, COL_OUTPUT_SEARCH_RAW);
+const TERMINAL_OFFSET: (i8, i8, i8) = shift_of(COL_BAR_FG_RAW, C_TERM_RAW);
+
+/// Palette of the finished frame: every role the UI can draw with, in RGB565.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Palette {
+    background: u16,
+    panel: u16,
+    panel_hi: u16,
+    border: u16,
+    border_dim: u16,
+    ink: u16,
+    label: u16,
+    label_hi: u16,
+    dim: u16,
+    accent: u16,
+    accent_dim: u16,
+    bar: u16,
+    bar_bg: u16,
+    warn: u16,
+    bad: u16,
+    battery_ok: u16,
+    output_ok: u16,
+    output_search: u16,
+    terminal: u16,
+}
+
+impl Palette {
+    /// `colors` are the ten configured words in `layer_names::COLOR_ROLES`
+    /// order: accent, accent shadow, background, panel, border, text, label,
+    /// bar, warning, critical.
+    const fn from_colors(colors: [u16; layer_names::COLOR_COUNT]) -> Self {
+        let panel = colors[3];
+        let border = colors[4];
+        let label = colors[6];
+        let bar = colors[7];
+        Self {
+            background: colors[2],
+            panel,
+            panel_hi: shift_raw(panel, PANEL_HI_OFFSET),
+            border,
+            border_dim: shift_raw(border, BORDER_DIM_OFFSET),
+            ink: colors[5],
+            label,
+            label_hi: shift_raw(label, LABEL_HI_OFFSET),
+            dim: shift_raw(label, LABEL_DIM_OFFSET),
+            accent: colors[0],
+            accent_dim: colors[1],
+            bar,
+            bar_bg: shift_raw(panel, BAR_BG_OFFSET),
+            warn: colors[8],
+            bad: colors[9],
+            battery_ok: shift_raw(bar, BATTERY_OK_OFFSET),
+            output_ok: shift_raw(bar, OUTPUT_OK_OFFSET),
+            output_search: shift_raw(colors[0], OUTPUT_SEARCH_OFFSET),
+            terminal: shift_raw(bar, TERMINAL_OFFSET),
+        }
+    }
+
+    fn from_settings(settings: &ScreenSettings) -> Self {
+        Self::from_colors(settings.colors)
+    }
+
+    /// Replaces a colour the UI drew with by its configured value. Anything the
+    /// palette does not name (pure black of the terminal screen) passes through.
+    const fn remap(&self, raw: u16) -> u16 {
+        match raw {
+            COL_BG_RAW => self.background,
+            COL_PANEL_RAW => self.panel,
+            COL_PANEL_HI_RAW => self.panel_hi,
+            COL_BORDER_RAW => self.border,
+            COL_BORDER_DIM_RAW => self.border_dim,
+            COL_FG_RAW => self.ink,
+            COL_MUTED_RAW => self.label,
+            COL_LABEL_RAW => self.label_hi,
+            COL_DIM_RAW => self.dim,
+            COL_ACCENT_RAW => self.accent,
+            COL_ACCENT_DIM_RAW => self.accent_dim,
+            COL_BAR_FG_RAW => self.bar,
+            COL_BAR_BG_RAW => self.bar_bg,
+            COL_YELLOW_RAW => self.warn,
+            COL_RED_RAW => self.bad,
+            C_OK_RAW => self.battery_ok,
+            COL_OUTPUT_OK_RAW => self.output_ok,
+            COL_OUTPUT_SEARCH_RAW => self.output_search,
+            C_TERM_RAW => self.terminal,
+            other => other,
+        }
+    }
+}
+
+/// The factory palette must be the identity: a device that never stored colours
+/// has to paint exactly the frame it painted before the settings existed.
+const FACTORY_PALETTE: Palette = Palette::from_colors(layer_names::DEFAULT_COLORS);
+const _: () = assert!(layer_names::DEFAULT_COLORS[0] == COL_ACCENT_RAW);
+const _: () = assert!(layer_names::DEFAULT_COLORS[1] == COL_ACCENT_DIM_RAW);
+const _: () = assert!(layer_names::DEFAULT_COLORS[2] == COL_BG_RAW);
+const _: () = assert!(layer_names::DEFAULT_COLORS[3] == COL_PANEL_RAW);
+const _: () = assert!(layer_names::DEFAULT_COLORS[4] == COL_BORDER_RAW);
+const _: () = assert!(layer_names::DEFAULT_COLORS[5] == COL_FG_RAW);
+const _: () = assert!(layer_names::DEFAULT_COLORS[6] == COL_MUTED_RAW);
+const _: () = assert!(layer_names::DEFAULT_COLORS[7] == COL_BAR_FG_RAW);
+const _: () = assert!(layer_names::DEFAULT_COLORS[8] == COL_YELLOW_RAW);
+const _: () = assert!(layer_names::DEFAULT_COLORS[9] == COL_RED_RAW);
+const _: () = assert!(FACTORY_PALETTE.background == COL_BG_RAW);
+const _: () = assert!(FACTORY_PALETTE.panel == COL_PANEL_RAW);
+const _: () = assert!(FACTORY_PALETTE.panel_hi == COL_PANEL_HI_RAW);
+const _: () = assert!(FACTORY_PALETTE.border == COL_BORDER_RAW);
+const _: () = assert!(FACTORY_PALETTE.border_dim == COL_BORDER_DIM_RAW);
+const _: () = assert!(FACTORY_PALETTE.ink == COL_FG_RAW);
+const _: () = assert!(FACTORY_PALETTE.label == COL_MUTED_RAW);
+const _: () = assert!(FACTORY_PALETTE.label_hi == COL_LABEL_RAW);
+const _: () = assert!(FACTORY_PALETTE.dim == COL_DIM_RAW);
+const _: () = assert!(FACTORY_PALETTE.accent == COL_ACCENT_RAW);
+const _: () = assert!(FACTORY_PALETTE.accent_dim == COL_ACCENT_DIM_RAW);
+const _: () = assert!(FACTORY_PALETTE.bar == COL_BAR_FG_RAW);
+const _: () = assert!(FACTORY_PALETTE.bar_bg == COL_BAR_BG_RAW);
+const _: () = assert!(FACTORY_PALETTE.warn == COL_YELLOW_RAW);
+const _: () = assert!(FACTORY_PALETTE.bad == COL_RED_RAW);
+const _: () = assert!(FACTORY_PALETTE.battery_ok == C_OK_RAW);
+const _: () = assert!(FACTORY_PALETTE.output_ok == COL_OUTPUT_OK_RAW);
+const _: () = assert!(FACTORY_PALETTE.output_search == COL_OUTPUT_SEARCH_RAW);
+const _: () = assert!(FACTORY_PALETTE.terminal == C_TERM_RAW);
 
 /// Connection indicator colours: green = active transport, blue = searching or
 /// reconnecting, grey = the dongle is not talking to anything.
@@ -414,9 +596,7 @@ impl OutputState {
 /// and the idle blank. Same maths the host stand applies to its PNGs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Look {
-    accent: Rgb565,
-    accent_dim: Rgb565,
-    background: Rgb565,
+    palette: Palette,
     brightness: u8,
     blank: bool,
 }
@@ -424,32 +604,23 @@ struct Look {
 impl Look {
     fn from_settings(settings: &ScreenSettings, blank: bool) -> Self {
         Self {
-            accent: rgb565_from_rgb8(settings.accent),
-            accent_dim: rgb565_from_rgb8(settings.accent_dim),
-            background: rgb565_from_rgb8(settings.background),
+            palette: Palette::from_settings(settings),
             brightness: settings.brightness.min(SCREEN_BRIGHTNESS_MAX),
             blank,
         }
     }
 }
 
-/// Rewrites one RGB565 pixel: the three palette entries the UI draws with are
-/// replaced by the configured colours, every component is scaled by the
-/// brightness setting, and a blanked screen becomes black. The panel driver
-/// applies this to each finished stripe.
+/// Rewrites one RGB565 pixel: every factory colour the UI draws with is replaced
+/// by the configured one, every component is scaled by the brightness setting,
+/// and a blanked screen becomes black. The panel driver applies this to each
+/// finished stripe, which is why the setting reaches the dashboard and all ten
+/// concepts without touching a single drawing call.
 fn look_pixel(raw: u16, look: &Look) -> u16 {
     if look.blank {
         return 0;
     }
-    let mut raw = if raw == COL_ACCENT_RAW {
-        look.accent.into_storage()
-    } else if raw == COL_ACCENT_DIM_RAW {
-        look.accent_dim.into_storage()
-    } else if raw == COL_BG_RAW {
-        look.background.into_storage()
-    } else {
-        raw
-    };
+    let mut raw = look.palette.remap(raw);
     let scale = look.brightness.min(SCREEN_BRIGHTNESS_MAX) as u32;
     if scale < SCREEN_BRIGHTNESS_MAX as u32 {
         let r5 = ((raw >> 11) & 0x1F) as u32 * scale / 100;

@@ -21,24 +21,37 @@
 //! ```text
 //! off  size  field
 //!   0     1  marker 0xE5
-//!   1     1  version (5)
+//!   1     1  version (6)
 //!   2   176  layer names: 16 x [len: u8, 10 bytes]
 //! 178     1  screen flags (bit0 wpm, bit1 modifiers, bit2 batteries, bit3 output)
 //! 179     1  header mode (0 media, 1 clock, 2 media + clock)
 //! 180     1  idle timeout, seconds (0 = never blank)
 //! 181     1  brightness (10..=100)
-//! 182     3  accent colour RGB
-//! 185     3  accent shadow colour RGB
-//! 188     3  background colour RGB
-//! 191     1  left battery label length
-//! 192     6  left battery label bytes
-//! 198     1  right battery label length
-//! 199     6  right battery label bytes
-//! 205     1  connection badge placement (0 header, 1 chip row)
-//! 206     1  screen concept (0 dashboard v2, 1..=10 alternative layouts)
-//! 207        (end of record, 17 bytes of the 224-byte budget stay unused)
+//! 182     2  accent colour RGB565
+//! 184     2  accent shadow colour RGB565
+//! 186     2  background colour RGB565
+//! 188     1  left battery label length
+//! 189     6  left battery label bytes
+//! 195     1  right battery label length
+//! 196     6  right battery label bytes
+//! 202     1  connection badge placement (0 header, 1 chip row)
+//! 203     1  screen concept (0 dashboard v2, 1..=10 alternative layouts)
+//! 204     2  panel colour RGB565
+//! 206     2  border colour RGB565
+//! 208     2  main text colour RGB565
+//! 210     2  caption / muted text colour RGB565
+//! 212     2  bar / scale fill colour RGB565
+//! 214     2  low-battery (yellow) colour RGB565
+//! 216     2  critical-battery (red) colour RGB565
+//! 218        (end of record, 6 bytes of the 224-byte budget stay unused)
 //! ```
 //!
+//! Colours are RGB565 words: every one is written by the client as three `u8`
+//! components (R, G, B) through three consecutive QSIDs and stored as one word,
+//! which saves a byte per colour against the version-5 layout. Version 5 (and
+//! 3/4) stored three components per colour; such records are read with the same
+//! conversion the panel uses for 8-bit colours, so a stored palette keeps its
+//! look and no screen setting is lost.
 //! Version 4 lacked the screen-concept byte, version 3 additionally lacked the
 //! badge placement; all older records are still read and upgraded in place.
 //! Version 2 used `LAYER_NAME_MAX = 12` (210 bytes of names, no screen
@@ -46,7 +59,7 @@
 //! migrated to the factory profile. Both are still readable.
 
 use core::str;
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicU16, AtomicU8, Ordering};
 
 use rmk::config::{VialDeviceSettings, VialDeviceSettingsData};
 
@@ -89,6 +102,69 @@ pub const QSID_SCREEN_OUTPUT_PLACE: u16 = 227;
 /// the alternative whole-screen layouts. **The numbers are a contract with
 /// Entropy — never renumber them.**
 pub const QSID_SCREEN_CONCEPT: u16 = 228;
+/// Colour block: every colour is written as three `u8` components (R, G, B,
+/// 0..=255) and stored as one RGB565 word. The numbers are a contract with the
+/// Entropy page — never renumber them.
+///
+/// Panel: fill of every card / plate (`COL_PANEL`).
+pub const QSID_SCREEN_PANEL: u16 = 230;
+pub const QSID_SCREEN_PANEL_G: u16 = QSID_SCREEN_PANEL + 1;
+pub const QSID_SCREEN_PANEL_B: u16 = QSID_SCREEN_PANEL + 2;
+/// Borders and hairlines (`COL_BORDER`).
+pub const QSID_SCREEN_BORDER: u16 = 233;
+pub const QSID_SCREEN_BORDER_G: u16 = QSID_SCREEN_BORDER + 1;
+pub const QSID_SCREEN_BORDER_B: u16 = QSID_SCREEN_BORDER + 2;
+/// Main text (`COL_FG`).
+pub const QSID_SCREEN_TEXT: u16 = 236;
+pub const QSID_SCREEN_TEXT_G: u16 = QSID_SCREEN_TEXT + 1;
+pub const QSID_SCREEN_TEXT_B: u16 = QSID_SCREEN_TEXT + 2;
+/// Captions and muted text (`COL_MUTED`, `COL_LABEL`, `COL_DIM`).
+pub const QSID_SCREEN_LABEL: u16 = 239;
+pub const QSID_SCREEN_LABEL_G: u16 = QSID_SCREEN_LABEL + 1;
+pub const QSID_SCREEN_LABEL_B: u16 = QSID_SCREEN_LABEL + 2;
+/// Bar / scale fill (`COL_BAR_FG`).
+pub const QSID_SCREEN_BAR: u16 = 242;
+pub const QSID_SCREEN_BAR_G: u16 = QSID_SCREEN_BAR + 1;
+pub const QSID_SCREEN_BAR_B: u16 = QSID_SCREEN_BAR + 2;
+/// Low-battery threshold colour (`COL_YELLOW`).
+pub const QSID_SCREEN_WARN: u16 = 245;
+pub const QSID_SCREEN_WARN_G: u16 = QSID_SCREEN_WARN + 1;
+pub const QSID_SCREEN_WARN_B: u16 = QSID_SCREEN_WARN + 2;
+/// Critical-battery threshold colour (`COL_RED`).
+pub const QSID_SCREEN_BAD: u16 = 248;
+pub const QSID_SCREEN_BAD_G: u16 = QSID_SCREEN_BAD + 1;
+pub const QSID_SCREEN_BAD_B: u16 = QSID_SCREEN_BAD + 2;
+
+/// Screen colours. Each colour occupies three consecutive QSIDs (R, G, B — one
+/// `u8` each, as the Ergohaven pages already do for the accent and background)
+/// and is stored as one RGB565 word.
+pub const COLOR_COUNT: usize = 10;
+/// First (R) QSID of every colour, in the order of [`ScreenSettings::colors`].
+pub const COLOR_FIRST_QSID: [u16; COLOR_COUNT] = [
+    QSID_SCREEN_ACCENT,
+    QSID_SCREEN_ACCENT_DIM,
+    QSID_SCREEN_BACKGROUND,
+    QSID_SCREEN_PANEL,
+    QSID_SCREEN_BORDER,
+    QSID_SCREEN_TEXT,
+    QSID_SCREEN_LABEL,
+    QSID_SCREEN_BAR,
+    QSID_SCREEN_WARN,
+    QSID_SCREEN_BAD,
+];
+/// Names of the same ten roles, for logs and the host harness.
+pub const COLOR_ROLES: [&str; COLOR_COUNT] = [
+    "accent",
+    "accent-shadow",
+    "background",
+    "panel",
+    "border",
+    "text",
+    "label",
+    "bar",
+    "warning",
+    "critical",
+];
 /// Software brightness, 10..=100. Same QSID the Ergohaven LCD screens use.
 pub const QSID_SCREEN_BRIGHTNESS: u16 = 318;
 /// Accent colour R/G/B. Same QSID pair group as the Ergohaven LCD text colour.
@@ -129,12 +205,62 @@ pub const SCREEN_BRIGHTNESS_MAX: u8 = 100;
 /// four bytes a shorter cap would allow.
 pub const BATTERY_LABEL_MAX: usize = 6;
 
-/// Factory palette. The values are the 8-bit expansion of the constants the
-/// screen used before settings existed, so a device that never stored settings
-/// renders exactly the previous frame (asserted in `qube_display.rs`).
+/// Factory palette, as 8-bit components (R, G, B). Each value is the 8-bit
+/// expansion of the constant the screen used before colours became settings, so
+/// the RGB565 word stored from it reproduces that constant exactly and a device
+/// with factory settings renders the previous frame (asserted in
+/// `qube_display.rs`).
 pub const DEFAULT_ACCENT: [u8; 3] = [24, 154, 255];
 pub const DEFAULT_ACCENT_DIM: [u8; 3] = [8, 65, 148];
 pub const DEFAULT_BACKGROUND: [u8; 3] = [0, 8, 33];
+pub const DEFAULT_PANEL: [u8; 3] = [16, 24, 74];
+pub const DEFAULT_BORDER: [u8; 3] = [41, 52, 132];
+pub const DEFAULT_TEXT: [u8; 3] = [239, 247, 247];
+pub const DEFAULT_LABEL: [u8; 3] = [90, 97, 165];
+pub const DEFAULT_BAR: [u8; 3] = [24, 170, 247];
+pub const DEFAULT_WARN: [u8; 3] = [255, 203, 0];
+pub const DEFAULT_BAD: [u8; 3] = [255, 21, 42];
+
+/// The factory palette in the stored format, in [`COLOR_ROLES`] order.
+pub const DEFAULT_COLORS: [u16; COLOR_COUNT] = [
+    rgb8_to_565(DEFAULT_ACCENT),
+    rgb8_to_565(DEFAULT_ACCENT_DIM),
+    rgb8_to_565(DEFAULT_BACKGROUND),
+    rgb8_to_565(DEFAULT_PANEL),
+    rgb8_to_565(DEFAULT_BORDER),
+    rgb8_to_565(DEFAULT_TEXT),
+    rgb8_to_565(DEFAULT_LABEL),
+    rgb8_to_565(DEFAULT_BAR),
+    rgb8_to_565(DEFAULT_WARN),
+    rgb8_to_565(DEFAULT_BAD),
+];
+
+/// 8-bit components → RGB565 word (the same rounding the panel uses).
+pub const fn rgb8_to_565(color: [u8; 3]) -> u16 {
+    (((color[0] >> 3) as u16) << 11) | (((color[1] >> 2) as u16) << 5) | ((color[2] >> 3) as u16)
+}
+
+/// RGB565 word → 8-bit components, so a client that writes R/G/B reads back a
+/// value within one 5/6-bit step of what it wrote.
+pub const fn rgb565_components(word: u16) -> [u8; 3] {
+    let r = ((word >> 11) & 0x1F) as u8;
+    let g = ((word >> 5) & 0x3F) as u8;
+    let b = (word & 0x1F) as u8;
+    [
+        (r << 3) | (r >> 2),
+        (g << 2) | (g >> 4),
+        (b << 3) | (b >> 2),
+    ]
+}
+
+/// Replaces one 8-bit component of an RGB565 word.
+fn rgb565_with_component(word: u16, component: usize, value: u8) -> u16 {
+    match component {
+        0 => (word & 0x07FF) | (((value >> 3) as u16) << 11),
+        1 => (word & 0xF81F) | (((value >> 2) as u16) << 5),
+        _ => (word & 0xFFE0) | ((value >> 3) as u16),
+    }
+}
 
 const SCREEN_FLAG_WPM: u8 = 1 << 0;
 const SCREEN_FLAG_MODIFIERS: u8 = 1 << 1;
@@ -143,7 +269,10 @@ const SCREEN_FLAG_OUTPUT: u8 = 1 << 3;
 
 const STORAGE_MARKER: u8 = 0xE5;
 /// Current record version. Bump together with the layout below.
-const STORAGE_VERSION: u8 = 5;
+const STORAGE_VERSION: u8 = 6;
+/// Version 5 stored every colour as three `u8` components and had no colour
+/// block; its record is 11 bytes shorter than the current one.
+const STORAGE_VERSION_V5: u8 = 5;
 /// Version 4 shipped every field except the screen concept (one byte shorter).
 const STORAGE_VERSION_V4: u8 = 4;
 /// Version 3 shared every field except the badge placement (its record is one
@@ -160,19 +289,37 @@ const HEADER_OFFSET: usize = FLAGS_OFFSET + 1;
 const TIMEOUT_OFFSET: usize = HEADER_OFFSET + 1;
 const BRIGHTNESS_OFFSET: usize = TIMEOUT_OFFSET + 1;
 const ACCENT_OFFSET: usize = BRIGHTNESS_OFFSET + 1;
-const ACCENT_DIM_OFFSET: usize = ACCENT_OFFSET + 3;
-const BACKGROUND_OFFSET: usize = ACCENT_DIM_OFFSET + 3;
-const LEFT_LABEL_LEN_OFFSET: usize = BACKGROUND_OFFSET + 3;
+const ACCENT_DIM_OFFSET: usize = ACCENT_OFFSET + 2;
+const BACKGROUND_OFFSET: usize = ACCENT_DIM_OFFSET + 2;
+const LEFT_LABEL_LEN_OFFSET: usize = BACKGROUND_OFFSET + 2;
 const LEFT_LABEL_OFFSET: usize = LEFT_LABEL_LEN_OFFSET + 1;
 const RIGHT_LABEL_LEN_OFFSET: usize = LEFT_LABEL_OFFSET + BATTERY_LABEL_MAX;
 const RIGHT_LABEL_OFFSET: usize = RIGHT_LABEL_LEN_OFFSET + 1;
 const PLACE_OFFSET: usize = RIGHT_LABEL_OFFSET + BATTERY_LABEL_MAX;
 const CONCEPT_OFFSET: usize = PLACE_OFFSET + 1;
-pub(crate) const SERIALIZED_LEN: usize = CONCEPT_OFFSET + 1;
+const PANEL_OFFSET: usize = CONCEPT_OFFSET + 1;
+const BORDER_OFFSET: usize = PANEL_OFFSET + 2;
+const TEXT_OFFSET: usize = BORDER_OFFSET + 2;
+const LABEL_OFFSET: usize = TEXT_OFFSET + 2;
+const BAR_OFFSET: usize = LABEL_OFFSET + 2;
+const WARN_OFFSET: usize = BAR_OFFSET + 2;
+const BAD_OFFSET: usize = WARN_OFFSET + 2;
+pub(crate) const SERIALIZED_LEN: usize = BAD_OFFSET + 2;
+
+// Offsets of the version 3..5 record: colours as three components and no
+// colour block behind the concept byte.
+const LEGACY_ACCENT_OFFSET: usize = BRIGHTNESS_OFFSET + 1;
+const LEGACY_ACCENT_DIM_OFFSET: usize = LEGACY_ACCENT_OFFSET + 3;
+const LEGACY_BACKGROUND_OFFSET: usize = LEGACY_ACCENT_DIM_OFFSET + 3;
+/// Length of a version-5 record (3-byte colours, placement + concept bytes).
+const SERIALIZED_LEN_V5: usize = 207;
+/// Placement and concept bytes as they sat in the version 3..5 layout.
+const LEGACY_PLACE_OFFSET: usize = 205;
+const LEGACY_CONCEPT_OFFSET: usize = 206;
 /// Length of a version-4 record (same layout without the concept byte).
-const SERIALIZED_LEN_V4: usize = CONCEPT_OFFSET;
+const SERIALIZED_LEN_V4: usize = 206;
 /// Length of a version-3 record (same layout without the placement byte).
-const SERIALIZED_LEN_V3: usize = PLACE_OFFSET;
+const SERIALIZED_LEN_V3: usize = 205;
 
 /// Length of a version-1/2 record (12-byte layer names, no screen settings).
 const LEGACY_SERIALIZED_LEN: usize =
@@ -180,12 +327,14 @@ const LEGACY_SERIALIZED_LEN: usize =
 
 const _: () = assert!(SERIALIZED_LEN <= 224);
 const _: () = assert!(SERIALIZED_LEN <= u8::MAX as usize);
-const _: () = assert!(SERIALIZED_LEN < LEGACY_SERIALIZED_LEN);
+// Version detection matches on the version byte, so a longer record than the
+// legacy one is fine: those records carry version 1/2.
+const _: () = assert!(SERIALIZED_LEN_V5 < SERIALIZED_LEN);
 
 /// Every key the firmware answers. Entropy walks this list with a
 /// "first key greater than the last one" query, so it must stay sorted
 /// ascending.
-const SETTING_KEYS: [u16; 36] = [
+const SETTING_KEYS: [u16; 57] = [
     // Layer names.
     200, 201, 202, 203, 204, 205, 206, 207, 208, 209, 210, 211, 212, 213, 214, 215,
     // Qube screen block.
@@ -202,6 +351,28 @@ const SETTING_KEYS: [u16; 36] = [
     QSID_SCREEN_ACCENT_DIM_B,
     QSID_SCREEN_OUTPUT_PLACE,
     QSID_SCREEN_CONCEPT,
+    // Colour block (three QSIDs per colour: R, G, B).
+    QSID_SCREEN_PANEL,
+    QSID_SCREEN_PANEL_G,
+    QSID_SCREEN_PANEL_B,
+    QSID_SCREEN_BORDER,
+    QSID_SCREEN_BORDER_G,
+    QSID_SCREEN_BORDER_B,
+    QSID_SCREEN_TEXT,
+    QSID_SCREEN_TEXT_G,
+    QSID_SCREEN_TEXT_B,
+    QSID_SCREEN_LABEL,
+    QSID_SCREEN_LABEL_G,
+    QSID_SCREEN_LABEL_B,
+    QSID_SCREEN_BAR,
+    QSID_SCREEN_BAR_G,
+    QSID_SCREEN_BAR_B,
+    QSID_SCREEN_WARN,
+    QSID_SCREEN_WARN_G,
+    QSID_SCREEN_WARN_B,
+    QSID_SCREEN_BAD,
+    QSID_SCREEN_BAD_G,
+    QSID_SCREEN_BAD_B,
     // Palette settings shared with the Ergohaven LCD numbering.
     QSID_SCREEN_BRIGHTNESS,
     QSID_SCREEN_ACCENT,
@@ -225,20 +396,18 @@ static SCREEN_TIMEOUT: AtomicU8 = AtomicU8::new(0);
 static SCREEN_PLACE: AtomicU8 = AtomicU8::new(SCREEN_OUTPUT_HEADER);
 static SCREEN_CONCEPT: AtomicU8 = AtomicU8::new(SCREEN_CONCEPT_DASHBOARD);
 static SCREEN_BRIGHTNESS: AtomicU8 = AtomicU8::new(SCREEN_BRIGHTNESS_MAX);
-static SCREEN_ACCENT: [AtomicU8; 3] = [
-    AtomicU8::new(DEFAULT_ACCENT[0]),
-    AtomicU8::new(DEFAULT_ACCENT[1]),
-    AtomicU8::new(DEFAULT_ACCENT[2]),
-];
-static SCREEN_ACCENT_DIM: [AtomicU8; 3] = [
-    AtomicU8::new(DEFAULT_ACCENT_DIM[0]),
-    AtomicU8::new(DEFAULT_ACCENT_DIM[1]),
-    AtomicU8::new(DEFAULT_ACCENT_DIM[2]),
-];
-static SCREEN_BACKGROUND: [AtomicU8; 3] = [
-    AtomicU8::new(DEFAULT_BACKGROUND[0]),
-    AtomicU8::new(DEFAULT_BACKGROUND[1]),
-    AtomicU8::new(DEFAULT_BACKGROUND[2]),
+/// Screen colours as RGB565 words (the panel's native format).
+static SCREEN_COLORS: [AtomicU16; COLOR_COUNT] = [
+    AtomicU16::new(DEFAULT_COLORS[0]),
+    AtomicU16::new(DEFAULT_COLORS[1]),
+    AtomicU16::new(DEFAULT_COLORS[2]),
+    AtomicU16::new(DEFAULT_COLORS[3]),
+    AtomicU16::new(DEFAULT_COLORS[4]),
+    AtomicU16::new(DEFAULT_COLORS[5]),
+    AtomicU16::new(DEFAULT_COLORS[6]),
+    AtomicU16::new(DEFAULT_COLORS[7]),
+    AtomicU16::new(DEFAULT_COLORS[8]),
+    AtomicU16::new(DEFAULT_COLORS[9]),
 ];
 static BATTERY_LABEL_LEN: [AtomicU8; 2] = [AtomicU8::new(0), AtomicU8::new(0)];
 static BATTERY_LABEL_BYTES: [AtomicU8; 2 * BATTERY_LABEL_MAX] =
@@ -300,14 +469,19 @@ pub struct ScreenSettings {
     pub concept: u8,
     /// Software dimming of the finished frame, `10..=100`.
     pub brightness: u8,
-    pub accent: [u8; 3],
-    pub accent_dim: [u8; 3],
-    pub background: [u8; 3],
+    /// Colours as RGB565 words, in [`COLOR_ROLES`] order: accent, accent shadow,
+    /// background, panel, border, text, label, bar, warning, critical.
+    pub colors: [u16; COLOR_COUNT],
     pub left_label: BatteryLabel,
     pub right_label: BatteryLabel,
 }
 
 impl ScreenSettings {
+    /// One colour as 8-bit components, for clients that write R/G/B.
+    pub const fn color_components(&self, index: usize) -> [u8; 3] {
+        rgb565_components(self.colors[index])
+    }
+
     /// Whether the header decodes a media ticker at all.
     pub const fn shows_media(&self) -> bool {
         matches!(self.header_mode, SCREEN_HEADER_MEDIA | SCREEN_HEADER_BOTH)
@@ -336,9 +510,7 @@ impl Default for ScreenSettings {
             output_place: SCREEN_OUTPUT_HEADER,
             concept: SCREEN_CONCEPT_DASHBOARD,
             brightness: SCREEN_BRIGHTNESS_MAX,
-            accent: DEFAULT_ACCENT,
-            accent_dim: DEFAULT_ACCENT_DIM,
-            background: DEFAULT_BACKGROUND,
+            colors: DEFAULT_COLORS,
             left_label: default_label(0),
             right_label: default_label(1),
         }
@@ -385,13 +557,9 @@ pub fn screen_settings() -> ScreenSettings {
         return ScreenSettings::default();
     }
     let flags = SCREEN_FLAGS.load(Ordering::Relaxed);
-    let mut accent = [0u8; 3];
-    let mut accent_dim = [0u8; 3];
-    let mut background = [0u8; 3];
-    for index in 0..3 {
-        accent[index] = SCREEN_ACCENT[index].load(Ordering::Relaxed);
-        accent_dim[index] = SCREEN_ACCENT_DIM[index].load(Ordering::Relaxed);
-        background[index] = SCREEN_BACKGROUND[index].load(Ordering::Relaxed);
+    let mut colors = DEFAULT_COLORS;
+    for (index, slot) in colors.iter_mut().enumerate() {
+        *slot = SCREEN_COLORS[index].load(Ordering::Relaxed);
     }
     ScreenSettings {
         wpm_visible: flags & SCREEN_FLAG_WPM != 0,
@@ -405,9 +573,7 @@ pub fn screen_settings() -> ScreenSettings {
         brightness: SCREEN_BRIGHTNESS
             .load(Ordering::Relaxed)
             .clamp(SCREEN_BRIGHTNESS_MIN, SCREEN_BRIGHTNESS_MAX),
-        accent,
-        accent_dim,
-        background,
+        colors,
         left_label: read_battery_label(0),
         right_label: read_battery_label(1),
     }
@@ -447,6 +613,14 @@ pub(crate) fn get_setting(qsid: u16, out: &mut [u8]) -> Option<usize> {
     }
 
     let settings = screen_settings();
+    if let Some((index, component)) = color_lookup(qsid) {
+        let value = settings.color_components(index)[component];
+        if out.is_empty() {
+            return Some(0);
+        }
+        out[0] = value;
+        return Some(1);
+    }
     let value = match qsid {
         QSID_SCREEN_WPM => settings.wpm_visible as u8,
         QSID_SCREEN_HEADER => settings.header_mode,
@@ -457,15 +631,6 @@ pub(crate) fn get_setting(qsid: u16, out: &mut [u8]) -> Option<usize> {
         QSID_SCREEN_OUTPUT_PLACE => settings.output_place.min(SCREEN_OUTPUT_CHIP),
         QSID_SCREEN_CONCEPT => settings.concept.min(SCREEN_CONCEPT_MAX),
         QSID_SCREEN_BRIGHTNESS => settings.brightness,
-        QSID_SCREEN_ACCENT => settings.accent[0],
-        QSID_SCREEN_ACCENT_G => settings.accent[1],
-        QSID_SCREEN_ACCENT_B => settings.accent[2],
-        QSID_SCREEN_ACCENT_DIM => settings.accent_dim[0],
-        QSID_SCREEN_ACCENT_DIM_G => settings.accent_dim[1],
-        QSID_SCREEN_ACCENT_DIM_B => settings.accent_dim[2],
-        QSID_SCREEN_BACKGROUND => settings.background[0],
-        QSID_SCREEN_BACKGROUND_G => settings.background[1],
-        QSID_SCREEN_BACKGROUND_B => settings.background[2],
         _ => return None,
     };
     if out.is_empty() {
@@ -503,6 +668,12 @@ pub(crate) fn set_setting(qsid: u16, value: &[u8]) -> bool {
     // A first write must start from the factory values, otherwise the fields
     // the client has not touched yet would stay at their zero initialisers.
     ensure_screen_loaded();
+    if let Some((index, component)) = color_lookup(qsid) {
+        let word = SCREEN_COLORS[index].load(Ordering::Relaxed);
+        SCREEN_COLORS[index].store(rgb565_with_component(word, component, first), Ordering::Relaxed);
+        SCREEN_SETTINGS_VERSION.fetch_add(1, Ordering::Relaxed);
+        return true;
+    }
     let stored = match qsid {
         QSID_SCREEN_WPM => update_flags(SCREEN_FLAG_WPM, first != 0),
         QSID_SCREEN_MODIFIERS => update_flags(SCREEN_FLAG_MODIFIERS, first != 0),
@@ -517,42 +688,6 @@ pub(crate) fn set_setting(qsid: u16, value: &[u8]) -> bool {
                 first.clamp(SCREEN_BRIGHTNESS_MIN, SCREEN_BRIGHTNESS_MAX),
                 Ordering::Relaxed,
             );
-            true
-        }
-        QSID_SCREEN_ACCENT => {
-            SCREEN_ACCENT[0].store(first, Ordering::Relaxed);
-            true
-        }
-        QSID_SCREEN_ACCENT_G => {
-            SCREEN_ACCENT[1].store(first, Ordering::Relaxed);
-            true
-        }
-        QSID_SCREEN_ACCENT_B => {
-            SCREEN_ACCENT[2].store(first, Ordering::Relaxed);
-            true
-        }
-        QSID_SCREEN_ACCENT_DIM => {
-            SCREEN_ACCENT_DIM[0].store(first, Ordering::Relaxed);
-            true
-        }
-        QSID_SCREEN_ACCENT_DIM_G => {
-            SCREEN_ACCENT_DIM[1].store(first, Ordering::Relaxed);
-            true
-        }
-        QSID_SCREEN_ACCENT_DIM_B => {
-            SCREEN_ACCENT_DIM[2].store(first, Ordering::Relaxed);
-            true
-        }
-        QSID_SCREEN_BACKGROUND => {
-            SCREEN_BACKGROUND[0].store(first, Ordering::Relaxed);
-            true
-        }
-        QSID_SCREEN_BACKGROUND_G => {
-            SCREEN_BACKGROUND[1].store(first, Ordering::Relaxed);
-            true
-        }
-        QSID_SCREEN_BACKGROUND_B => {
-            SCREEN_BACKGROUND[2].store(first, Ordering::Relaxed);
             true
         }
         _ => false,
@@ -605,9 +740,9 @@ pub(crate) fn serialize() -> VialDeviceSettingsData {
     data.data[HEADER_OFFSET] = settings.header_mode.min(SCREEN_HEADER_BOTH);
     data.data[TIMEOUT_OFFSET] = settings.timeout_s;
     data.data[BRIGHTNESS_OFFSET] = settings.brightness;
-    data.data[ACCENT_OFFSET..ACCENT_OFFSET + 3].copy_from_slice(&settings.accent);
-    data.data[ACCENT_DIM_OFFSET..ACCENT_DIM_OFFSET + 3].copy_from_slice(&settings.accent_dim);
-    data.data[BACKGROUND_OFFSET..BACKGROUND_OFFSET + 3].copy_from_slice(&settings.background);
+    for (index, offset) in COLOR_OFFSETS.iter().enumerate() {
+        data.data[*offset..*offset + 2].copy_from_slice(&settings.colors[index].to_le_bytes());
+    }
     data.data[LEFT_LABEL_LEN_OFFSET] = settings.left_label.len;
     data.data[LEFT_LABEL_OFFSET..LEFT_LABEL_OFFSET + BATTERY_LABEL_MAX]
         .copy_from_slice(&settings.left_label.bytes);
@@ -635,17 +770,26 @@ pub(crate) fn deserialize(bytes: &[u8]) {
                 bytes[CONCEPT_OFFSET],
             ));
         }
+        // Version 5 stored every colour as three components and had no colour
+        // block: read the old fields and convert them to RGB565.
+        (STORAGE_VERSION_V5, len) if len >= SERIALIZED_LEN_V5 => {
+            store_screen_settings(&stored_screen_settings_legacy(
+                bytes,
+                bytes[LEGACY_PLACE_OFFSET],
+                bytes[LEGACY_CONCEPT_OFFSET],
+            ));
+        }
         // Version 4 shipped every screen field except the concept.
         (STORAGE_VERSION_V4, len) if len >= SERIALIZED_LEN_V4 => {
-            store_screen_settings(&stored_screen_settings(
+            store_screen_settings(&stored_screen_settings_legacy(
                 bytes,
-                bytes[PLACE_OFFSET],
+                bytes[LEGACY_PLACE_OFFSET],
                 SCREEN_CONCEPT_DASHBOARD,
             ));
         }
         // Version 3 shipped every screen field except the badge placement.
         (STORAGE_VERSION_V3, len) if len >= SERIALIZED_LEN_V3 => {
-            store_screen_settings(&stored_screen_settings(
+            store_screen_settings(&stored_screen_settings_legacy(
                 bytes,
                 SCREEN_OUTPUT_HEADER,
                 SCREEN_CONCEPT_DASHBOARD,
@@ -675,11 +819,27 @@ pub(crate) fn deserialize(bytes: &[u8]) {
     bump_versions();
 }
 
-/// Decodes the screen block of a version 3/4 record. The caller passes the
-/// badge placement and the concept explicitly, because version 3 has no byte
-/// for the placement and version 3/4 have none for the concept.
+/// Offsets of the ten colours in the current record, in [`COLOR_ROLES`] order.
+const COLOR_OFFSETS: [usize; COLOR_COUNT] = [
+    ACCENT_OFFSET,
+    ACCENT_DIM_OFFSET,
+    BACKGROUND_OFFSET,
+    PANEL_OFFSET,
+    BORDER_OFFSET,
+    TEXT_OFFSET,
+    LABEL_OFFSET,
+    BAR_OFFSET,
+    WARN_OFFSET,
+    BAD_OFFSET,
+];
+
+/// Decodes the screen block of the current record: colours as RGB565 words.
 fn stored_screen_settings(bytes: &[u8], output_place: u8, concept: u8) -> ScreenSettings {
     read_layer_names(bytes, LAYER_NAMES_OFFSET, LAYER_NAME_MAX, LAYER_NAME_COUNT);
+    let mut colors = DEFAULT_COLORS;
+    for (index, offset) in COLOR_OFFSETS.iter().enumerate() {
+        colors[index] = u16::from_le_bytes([bytes[*offset], bytes[*offset + 1]]);
+    }
     // A truncated (or empty) screen block must not leak zeros: prefer the
     // factory defaults whenever the stored bytes are missing.
     ScreenSettings {
@@ -692,21 +852,7 @@ fn stored_screen_settings(bytes: &[u8], output_place: u8, concept: u8) -> Screen
         output_place: output_place.min(SCREEN_OUTPUT_CHIP),
         concept: concept.min(SCREEN_CONCEPT_MAX),
         brightness: bytes[BRIGHTNESS_OFFSET].clamp(SCREEN_BRIGHTNESS_MIN, SCREEN_BRIGHTNESS_MAX),
-        accent: [
-            bytes[ACCENT_OFFSET],
-            bytes[ACCENT_OFFSET + 1],
-            bytes[ACCENT_OFFSET + 2],
-        ],
-        accent_dim: [
-            bytes[ACCENT_DIM_OFFSET],
-            bytes[ACCENT_DIM_OFFSET + 1],
-            bytes[ACCENT_DIM_OFFSET + 2],
-        ],
-        background: [
-            bytes[BACKGROUND_OFFSET],
-            bytes[BACKGROUND_OFFSET + 1],
-            bytes[BACKGROUND_OFFSET + 2],
-        ],
+        colors,
         left_label: stored_battery_label(
             bytes[LEFT_LABEL_LEN_OFFSET],
             &bytes[LEFT_LABEL_OFFSET..LEFT_LABEL_OFFSET + BATTERY_LABEL_MAX],
@@ -718,6 +864,49 @@ fn stored_screen_settings(bytes: &[u8], output_place: u8, concept: u8) -> Screen
             1,
         ),
     }
+}
+
+/// Decodes a version 3/4/5 record: the same screen block, but every colour is
+/// still three 8-bit components. They are converted to RGB565 with the same
+/// rounding the panel uses, so a stored factory palette keeps looking identical.
+fn stored_screen_settings_legacy(bytes: &[u8], output_place: u8, concept: u8) -> ScreenSettings {
+    read_layer_names(bytes, LAYER_NAMES_OFFSET, LAYER_NAME_MAX, LAYER_NAME_COUNT);
+    let mut colors = DEFAULT_COLORS;
+    let legacy_colors: [[u8; 3]; 3] = [
+        legacy_color(bytes, LEGACY_ACCENT_OFFSET),
+        legacy_color(bytes, LEGACY_ACCENT_DIM_OFFSET),
+        legacy_color(bytes, LEGACY_BACKGROUND_OFFSET),
+    ];
+    colors[0] = rgb8_to_565(legacy_colors[0]);
+    colors[1] = rgb8_to_565(legacy_colors[1]);
+    colors[2] = rgb8_to_565(legacy_colors[2]);
+    ScreenSettings {
+        wpm_visible: bytes[FLAGS_OFFSET] & SCREEN_FLAG_WPM != 0,
+        header_mode: bytes[HEADER_OFFSET].min(SCREEN_HEADER_BOTH),
+        timeout_s: bytes[TIMEOUT_OFFSET],
+        show_modifiers: bytes[FLAGS_OFFSET] & SCREEN_FLAG_MODIFIERS != 0,
+        show_batteries: bytes[FLAGS_OFFSET] & SCREEN_FLAG_BATTERIES != 0,
+        output_visible: bytes[FLAGS_OFFSET] & SCREEN_FLAG_OUTPUT != 0,
+        output_place: output_place.min(SCREEN_OUTPUT_CHIP),
+        concept: concept.min(SCREEN_CONCEPT_MAX),
+        brightness: bytes[BRIGHTNESS_OFFSET].clamp(SCREEN_BRIGHTNESS_MIN, SCREEN_BRIGHTNESS_MAX),
+        colors,
+        left_label: stored_battery_label(
+            bytes[LEFT_LABEL_LEN_OFFSET],
+            &bytes[LEFT_LABEL_OFFSET..LEFT_LABEL_OFFSET + BATTERY_LABEL_MAX],
+            0,
+        ),
+        right_label: stored_battery_label(
+            bytes[RIGHT_LABEL_LEN_OFFSET],
+            &bytes[RIGHT_LABEL_OFFSET..RIGHT_LABEL_OFFSET + BATTERY_LABEL_MAX],
+            1,
+        ),
+    }
+}
+
+/// Three 8-bit components of a legacy record.
+fn legacy_color(bytes: &[u8], offset: usize) -> [u8; 3] {
+    [bytes[offset], bytes[offset + 1], bytes[offset + 2]]
 }
 
 fn bump_versions() {
@@ -951,10 +1140,8 @@ fn store_screen_settings(settings: &ScreenSettings) {
             .clamp(SCREEN_BRIGHTNESS_MIN, SCREEN_BRIGHTNESS_MAX),
         Ordering::Relaxed,
     );
-    for index in 0..3 {
-        SCREEN_ACCENT[index].store(settings.accent[index], Ordering::Relaxed);
-        SCREEN_ACCENT_DIM[index].store(settings.accent_dim[index], Ordering::Relaxed);
-        SCREEN_BACKGROUND[index].store(settings.background[index], Ordering::Relaxed);
+    for (index, value) in settings.colors.iter().enumerate() {
+        SCREEN_COLORS[index].store(*value, Ordering::Relaxed);
     }
     store_battery_label(0, settings.left_label.as_str());
     store_battery_label(1, settings.right_label.as_str());
@@ -989,4 +1176,14 @@ fn migrate_legacy_placeholders() {
 fn layer_index(qsid: u16) -> Option<usize> {
     let offset = qsid.checked_sub(LAYER_NAME_QSID_BASE)?;
     (offset < LAYER_NAME_COUNT as u16).then_some(usize::from(offset))
+}
+
+/// `QSID → (colour index, component)`, component `0 = R, 1 = G, 2 = B`.
+fn color_lookup(qsid: u16) -> Option<(usize, usize)> {
+    for (index, first) in COLOR_FIRST_QSID.iter().enumerate() {
+        if qsid >= *first && qsid < *first + 3 {
+            return Some((index, usize::from(qsid - *first)));
+        }
+    }
+    None
 }
