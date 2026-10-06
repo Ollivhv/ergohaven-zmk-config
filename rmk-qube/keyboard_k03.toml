@@ -139,14 +139,12 @@ matrix_map = """
 name = "Base"
 # Common factory layers mirror K:04. K:03 keeps its six hardware encoders;
 # hardware-specific pointing actions are not copied.
-# The top-left key switches the OS keyboard layout: Left Alt + Left Shift
-# (RMK "WM(key, modifier)" — key LShift pressed together with modifier LAlt).
 keys = """
-WM(LShift,LAlt)  Kc1   Kc2   Kc3   Kc4   Kc5   Kc6   Kc7   Kc8   Kc9   Kc0   Backspace
+Grave   Kc1   Kc2   Kc3   Kc4   Kc5   Kc6   Kc7   Kc8   Kc9   Kc0   Backspace
 Escape  Q     W     E     R     T     Y     U     I     O     P     Backslash
 Tab     A     S     D     F     G     H     J     K     L     Semicolon  Quote
-LShift  Z     X     C     V     B     LeftBracket    RightBracket  N  M  Comma  Dot  Slash  Minus
-LGui  LAlt  LCtrl MO(1) Enter Space MO(2) RAlt Equal Delete
+LShift  Z     X     C     V     B     _              _             N  M  Comma  Dot  Slash  RShift
+Delete  LGui  LCtrl MO(1) Space Enter MO(2) RAlt LeftBracket RightBracket
 """
 encoders = [["AudioVolUp","AudioVolDown"],["AudioVolUp","AudioVolDown"],["AudioVolUp","AudioVolDown"],["AudioVolUp","AudioVolDown"],["AudioVolUp","AudioVolDown"],["AudioVolUp","AudioVolDown"]]
 
@@ -157,7 +155,7 @@ F1             F2              F3    F4    F5     F6      F7  F8   F9   F10  F11
 MediaPrevTrack MediaNextTrack  Home  Up    End    Insert  _   Kc7  Kc8  Kc9  _    CapsLock
 AudioMute      MediaPlayPause  Left  Down  Right  Enter   _   Kc4  Kc5  Kc6  _    CapsWordToggle
 AudioVolDown   AudioVolUp      _     _     _      Delete  _   _    PrintScreen Kc1 Kc2 Kc3 _ _
-PageDown       PageUp          _     MO(1) _      _       MO(3) _    Kc0  _
+PageDown       PageUp          _     _     _      _       MO(3) _    Kc0  _
 """
 encoders = [["AudioVolUp","AudioVolDown"],["AudioVolUp","AudioVolDown"],["AudioVolUp","AudioVolDown"],["AudioVolUp","AudioVolDown"],["AudioVolUp","AudioVolDown"],["AudioVolUp","AudioVolDown"]]
 
@@ -177,8 +175,8 @@ name = "Adjust"
 keys = """
 Bootloader  _  _  _  _  _  User0 User1 User2 User3 User4 User7
 _           _  _  _  _  _  _     _     _     _     _     _
-_           _  _  _  _  _  No No _ _ _ _
-_           _  _  _  _  _  _     _     No _ _ _ _ _
+_           _  _  _  _  _  OutputBluetooth No _ _ _ _
+_           _  _  _  _  _  _     _     OutputUsb _ _ _ _ _
 _           _  _  _  _  _  _     _     _     _
 """
 encoders = [["AudioVolUp","AudioVolDown"],["AudioVolUp","AudioVolDown"],["AudioVolUp","AudioVolDown"],["AudioVolUp","AudioVolDown"],["AudioVolUp","AudioVolDown"],["AudioVolUp","AudioVolDown"]]

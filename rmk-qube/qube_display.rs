@@ -20,7 +20,7 @@ use embassy_nrf::peripherals::{P0_02, P0_03, P0_28, P1_10, P1_11, P1_13, SPI3};
 use embassy_nrf::spim::{self, Spim};
 use embassy_nrf::{interrupt, Peri};
 use embassy_time::{Delay, Duration, Instant, Timer};
-use embedded_graphics::mono_font::ascii::{FONT_10X20, FONT_6X10, FONT_8X13};
+use embedded_graphics::mono_font::ascii::{FONT_10X20, FONT_6X10, FONT_8X13, FONT_9X15};
 use embedded_graphics::mono_font::MonoTextStyle;
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::*;
@@ -71,10 +71,9 @@ const BAR_RADIUS: u32 = 5;
 // 280x240 RGB565 transfer at 8 MHz takes over 130 ms before render overhead;
 // these bands match the fixed vertical zones rendered below.
 const HEADER_DIRTY: DirtyRegion = DirtyRegion::range(12, 44);
-const LAYER_DIRTY: DirtyRegion = DirtyRegion::range(44, 102);
-const WPM_DIRTY: DirtyRegion = DirtyRegion::range(102, 162);
-const MODIFIER_DIRTY: DirtyRegion = DirtyRegion::range(162, 184);
-const BATTERY_DIRTY: DirtyRegion = DirtyRegion::range(184, 230);
+const LAYER_DIRTY: DirtyRegion = DirtyRegion::range(50, 138);
+const MODIFIER_DIRTY: DirtyRegion = DirtyRegion::range(144, 166);
+const BATTERY_DIRTY: DirtyRegion = DirtyRegion::range(174, 224);
 // Display state may be a few frames late, but cursor motion must never wait
 // behind framebuffer rendering or SPI. Apply pending UI changes once the
 // pointing stream has been quiet for this window.
@@ -99,157 +98,6 @@ const COL_PANEL: Rgb565 = Rgb565::new(2, 6, 9);
 const COL_PANEL_HI: Rgb565 = Rgb565::new(3, 9, 13);
 const COL_BORDER: Rgb565 = Rgb565::new(5, 13, 16);
 const COL_BORDER_DIM: Rgb565 = Rgb565::new(3, 8, 11);
-
-
-// --- Boot splash ------------------------------------------------------------
-
-
-/// How long the wordmark stays on screen after power-up.
-const SPLASH_DURATION: Duration = Duration::from_millis(2000);
-
-
-/// Firmware version injected by `build.rs` (`RMK_FIRMWARE_VERSION`).
-const FIRMWARE_VERSION: &str = match option_env!("RMK_FIRMWARE_VERSION") {
-    Some(version) => version,
-    None => "dev",
-};
-
-
-/// Wordmark anchor in *screen* coordinates: top edge, horizontally centred.
-const SPLASH_WORD_TOP: Point = Point::new(SCREEN_W as i32 / 2, 84);
-/// Layer-name anchor in screen coordinates: top edge, horizontally centred.
-const LAYER_NAME_TOP: Point = Point::new(SCREEN_W as i32 / 2, 54);
-/// WPM value anchor in screen coordinates: right edge, top edge.
-const WPM_VALUE_RIGHT_TOP: Point = Point::new(248, 112);
-
-
-// --- x2 text scaling --------------------------------------------------------
-
-
-/// Scratch target that rasterises text at 1x into a tiny fixed buffer.
-///
-/// The buffer is a plain `DrawTarget` of its own: text rendering therefore
-/// never re-enters the panel target with synthesised shapes, and the later
-/// blit writes enlarged pixels through `draw_iter` on the panel target, in
-/// *screen* coordinates — exactly the path the stock renderer already uses.
-const GLYPH_BUF_W: u32 = 12;
-const GLYPH_BUF_H: u32 = 22;
-const GLYPH_BUF_LEN: usize = (GLYPH_BUF_W * GLYPH_BUF_H) as usize;
-
-struct GlyphBuf {
-    pixels: [bool; GLYPH_BUF_LEN],
-}
-
-impl GlyphBuf {
-    fn new() -> Self {
-        Self {
-            pixels: [false; GLYPH_BUF_LEN],
-        }
-    }
-
-    fn clear(&mut self) {
-        self.pixels = [false; GLYPH_BUF_LEN];
-    }
-
-    fn is_set(&self, x: i32, y: i32) -> bool {
-        if x < 0 || y < 0 {
-            return false;
-        }
-        let (x, y) = (x as u32, y as u32);
-        if x >= GLYPH_BUF_W || y >= GLYPH_BUF_H {
-            return false;
-        }
-        let index = (y * GLYPH_BUF_W + x) as usize;
-        index < GLYPH_BUF_LEN && self.pixels[index]
-    }
-}
-
-impl OriginDimensions for GlyphBuf {
-    fn size(&self) -> Size {
-        Size::new(GLYPH_BUF_W, GLYPH_BUF_H)
-    }
-}
-
-impl DrawTarget for GlyphBuf {
-    type Color = Rgb565;
-    type Error = core::convert::Infallible;
-
-    fn draw_iter<I>(&mut self, pixels: I) -> Result<(), Self::Error>
-    where
-        I: IntoIterator<Item = Pixel<Rgb565>>,
-    {
-        for Pixel(point, _) in pixels {
-            if point.x < 0 || point.y < 0 {
-                continue;
-            }
-            let (x, y) = (point.x as u32, point.y as u32);
-            if x >= GLYPH_BUF_W || y >= GLYPH_BUF_H {
-                continue;
-            }
-            let index = (y * GLYPH_BUF_W + x) as usize;
-            if index < GLYPH_BUF_LEN {
-                self.pixels[index] = true;
-            }
-        }
-        Ok(())
-    }
-}
-
-
-/// Draws `text` at double size: each glyph is rasterised at 1x into `GlyphBuf`
-/// and then blitted as 2x2 blocks of `color`.
-///
-/// `anchor` is in screen coordinates: `y` is the top edge of the text box and
-/// `x` is the left edge, centre or right edge depending on `align`.
-fn draw_text_x2<D>(
-    display: &mut D,
-    text: &str,
-    anchor: Point,
-    style: MonoTextStyle<'_, Rgb565>,
-    align: Alignment,
-) where
-    D: DrawTarget<Color = Rgb565>,
-{
-    let top_left = TextStyleBuilder::new().baseline(Baseline::Top).build();
-    let advance = (style.font.character_size.width + style.font.character_spacing) as i32;
-    let spacing = style.font.character_spacing as i32;
-    let glyphs = text.chars().count() as i32;
-    let width = (glyphs * advance - spacing).max(0) * 2;
-
-    let mut pen_x = match align {
-        Alignment::Left => anchor.x,
-        Alignment::Center => anchor.x - width / 2,
-        Alignment::Right => anchor.x - width,
-    };
-
-    let mut buffer = GlyphBuf::new();
-    let mut single: heapless::String<8> = heapless::String::new();
-    for ch in text.chars() {
-        buffer.clear();
-        single.clear();
-        let _ = single.push(ch);
-        let _ = Text::with_text_style(&single, Point::zero(), style, top_left).draw(&mut buffer);
-
-        for y in 0..GLYPH_BUF_H as i32 {
-            for x in 0..GLYPH_BUF_W as i32 {
-                if !buffer.is_set(x, y) {
-                    continue;
-                }
-                let sx = pen_x + x * 2;
-                let sy = anchor.y + y * 2;
-                if let Some(color) = style.text_color {
-                    let _ = display.draw_iter([
-                        Pixel(Point::new(sx, sy), color),
-                        Pixel(Point::new(sx + 1, sy), color),
-                        Pixel(Point::new(sx, sy + 1), color),
-                        Pixel(Point::new(sx + 1, sy + 1), color),
-                    ]);
-                }
-            }
-        }
-        pen_x += advance * 2;
-    }
-}
 
 type SpiDev = ExclusiveDevice<Spim<'static>, Output<'static>, NoDelay>;
 type Di = SpiInterface<SpiDev, Output<'static>>;
@@ -550,8 +398,6 @@ where
     lcd: LazyQubeLcd<I>,
     renderer: QubeStatusRenderer,
     ctx: RenderContext,
-    /// Uptime when this processor was created — drives the boot splash.
-    boot_at: Instant,
     last_host_data: rmk::host_data::HostData,
     last_layer_names_version: u8,
     last_render: Instant,
@@ -602,10 +448,8 @@ where
         },
         renderer: QubeStatusRenderer {
             host_data: host_data.clone(),
-            splash: true,
         },
         ctx: RenderContext::default(),
-        boot_at: Instant::now(),
         last_host_data: host_data,
         last_layer_names_version: crate::layer_names::version(),
         last_render: Instant::from_ticks(0),
@@ -930,12 +774,7 @@ where
                 need_redraw = false;
             }
             UiEv::Wpm(e) => {
-                // Only repaint when the number really changed: RMK may publish
-                // repeated WPM updates and each band repaint costs two stripes.
-                if self.ctx.wpm != e.0 {
-                    self.ctx.wpm = e.0;
-                    self.request_redraw_region(WPM_DIRTY);
-                }
+                self.ctx.wpm = e.0;
                 need_redraw = false;
             }
             UiEv::Led(e) => {
@@ -977,10 +816,6 @@ where
             }
             UiEv::Central(e) => self.ctx.central_connected = e.connected,
             UiEv::HostDataTick => {
-                if self.renderer.splash && self.boot_at.elapsed() >= SPLASH_DURATION {
-                    self.renderer.splash = false;
-                    self.request_redraw();
-                }
                 self.sync_host_data();
                 self.sync_layer_names();
                 if self.renderer.media_needs_marquee() {
@@ -1019,15 +854,12 @@ where
 //
 // Fixed vertical zones (280x240) so nothing overlaps:
 //   14..42   compact header
-//   46..100  layer panel (compact, x2 name)
-//   106..160 WPM panel (x2 value)
-//   166..182 modifier state
-//   188..228 battery cards
+//   52..136  layer panel
+//   146..164 modifier state
+//   176..222 battery cards
 
 pub struct QubeStatusRenderer {
     host_data: rmk::host_data::HostData,
-    /// Boot splash is on screen, the dashboard is not drawn yet.
-    splash: bool,
 }
 
 impl QubeStatusRenderer {
@@ -1038,14 +870,11 @@ impl QubeStatusRenderer {
     }
 
     fn render_modifiers<D: DrawTarget<Color = Rgb565>>(&self, ctx: &RenderContext, display: &mut D) {
-        if self.splash {
-            return;
-        }
-        draw_chip(display, 30, 166, 38, "CAPS", ctx.caps_lock);
+        draw_chip(display, 30, 146, 38, "CAPS", ctx.caps_lock);
         draw_chip(
             display,
             76,
-            166,
+            146,
             38,
             "CTRL",
             ctx.modifiers.left_ctrl() || ctx.modifiers.right_ctrl(),
@@ -1053,7 +882,7 @@ impl QubeStatusRenderer {
         draw_chip(
             display,
             122,
-            166,
+            146,
             46,
             "SHIFT",
             ctx.modifiers.left_shift() || ctx.modifiers.right_shift(),
@@ -1061,7 +890,7 @@ impl QubeStatusRenderer {
         draw_chip(
             display,
             176,
-            166,
+            146,
             34,
             "ALT",
             ctx.modifiers.left_alt() || ctx.modifiers.right_alt(),
@@ -1069,7 +898,7 @@ impl QubeStatusRenderer {
         draw_chip(
             display,
             218,
-            166,
+            146,
             34,
             "GUI",
             ctx.modifiers.left_gui() || ctx.modifiers.right_gui(),
@@ -1081,20 +910,23 @@ impl DisplayRenderer<Rgb565> for QubeStatusRenderer {
     fn render<D: DrawTarget<Color = Rgb565>>(&mut self, ctx: &RenderContext, display: &mut D) {
         let _ = display.clear(COL_BG);
 
-        if self.splash {
-            render_splash(display);
-            return;
-        }
-
         let layer_meta = MonoTextStyle::new(&FONT_6X10, COL_LABEL);
         let header_media = MonoTextStyle::new(&FONT_6X10, COL_FG);
         let header_fallback = MonoTextStyle::new(&FONT_8X13, COL_ACCENT);
         let body = MonoTextStyle::new(&FONT_8X13, COL_FG);
-        let wpm_label = MonoTextStyle::new(&FONT_6X10, COL_MUTED);
-        let top_left = TextStyleBuilder::new().baseline(Baseline::Top).build();
+        let title_shadow = MonoTextStyle::new(&FONT_10X20, COL_ACCENT_DIM);
+        let title = MonoTextStyle::new(&FONT_10X20, COL_FG);
+        let tc = TextStyleBuilder::new()
+            .alignment(Alignment::Center)
+            .baseline(Baseline::Top)
+            .build();
         let tr = TextStyleBuilder::new()
             .alignment(Alignment::Right)
             .baseline(Baseline::Top)
+            .build();
+        let mc = TextStyleBuilder::new()
+            .alignment(Alignment::Center)
+            .baseline(Baseline::Middle)
             .build();
         let left = ctx.peripherals_connected.first().copied().unwrap_or(false);
         let right = ctx.peripherals_connected.get(1).copied().unwrap_or(false);
@@ -1117,100 +949,39 @@ impl DisplayRenderer<Rgb565> for QubeStatusRenderer {
                     .draw(display);
         }
 
-        // Layer panel (compact strip, x2 name).
+        // Layer panel.
         draw_panel(
             display,
             SAFE_X,
-            46,
+            52,
             SAFE_W,
-            54,
+            84,
             COL_PANEL_HI,
             COL_BORDER_DIM,
         );
         s.clear();
-        let _ = write!(&mut s, "L{}", ctx.layer);
-        let _ = Text::with_text_style(&s, Point::new(SAFE_X + 12, 50), layer_meta, top_left)
+        let _ = write!(&mut s, "LAYER {}", ctx.layer);
+        let _ = Text::with_text_style(&s, Point::new(SCREEN_W as i32 / 2, 66), layer_meta, tc)
             .draw(display);
-        if !name.is_empty() {
-            draw_text_x2(
-                display,
-                name,
-                Point::new(LAYER_NAME_TOP.x + 1, LAYER_NAME_TOP.y + 1),
-                MonoTextStyle::new(&FONT_10X20, COL_ACCENT_DIM),
-                Alignment::Center,
-            );
-            draw_text_x2(
-                display,
-                name,
-                LAYER_NAME_TOP,
-                MonoTextStyle::new(&FONT_10X20, COL_FG),
-                Alignment::Center,
-            );
-        }
-
-        // WPM panel (x2 value).
-        draw_panel(display, SAFE_X, 106, SAFE_W, 54, COL_PANEL, COL_BORDER_DIM);
-        s.clear();
-        let _ = write!(&mut s, "WPM");
-        let _ = Text::with_text_style(&s, Point::new(SAFE_X + 12, 112), wpm_label, top_left)
+        let _ = Text::with_text_style(
+            name,
+            Point::new(SCREEN_W as i32 / 2 + 1, 101),
+            title_shadow,
+            mc,
+        )
+        .draw(display);
+        let _ = Text::with_text_style(name, Point::new(SCREEN_W as i32 / 2, 100), title, mc)
             .draw(display);
-        s.clear();
-        let _ = write!(&mut s, "{}", ctx.wpm);
-        draw_text_x2(
-            display,
-            &s,
-            WPM_VALUE_RIGHT_TOP,
-            MonoTextStyle::new(&FONT_10X20, COL_ACCENT),
-            Alignment::Right,
-        );
+        draw_round_fill(display, 104, 125, 72, 2, 1, COL_ACCENT_DIM);
 
         // Modifier chips.
         self.render_modifiers(ctx, display);
 
         // Battery cards.
-        draw_bat(display, SAFE_X, 188, 116, lp, left, "LEFT");
-        draw_bat(display, 146, 188, 116, rp, right, "RIGHT");
+        draw_bat(display, SAFE_X, 176, 116, lp, left, "LEFT");
+        draw_bat(display, 146, 176, 116, rp, right, "RIGHT");
     }
 }
-
-/// Boot splash: accent bars, x2 wordmark and the firmware version.
-fn render_splash<D: DrawTarget<Color = Rgb565>>(display: &mut D) {
-    let top = TextStyleBuilder::new()
-        .alignment(Alignment::Center)
-        .baseline(Baseline::Top)
-        .build();
-    let version_style = MonoTextStyle::new(&FONT_8X13, COL_MUTED);
-
-
-    draw_round_fill(display, 96, 72, 88, 3, 1, COL_ACCENT);
-    draw_text_x2(
-        display,
-        "QUBE",
-        Point::new(SPLASH_WORD_TOP.x + 1, SPLASH_WORD_TOP.y + 1),
-        MonoTextStyle::new(&FONT_10X20, COL_ACCENT_DIM),
-        Alignment::Center,
-    );
-    draw_text_x2(
-        display,
-        "QUBE",
-        SPLASH_WORD_TOP,
-        MonoTextStyle::new(&FONT_10X20, COL_FG),
-        Alignment::Center,
-    );
-    draw_round_fill(display, 60, 140, 160, 2, 1, COL_ACCENT_DIM);
-
-
-    let mut version: heapless::String<24> = heapless::String::new();
-    let _ = write!(&mut version, "RMK {}", FIRMWARE_VERSION);
-    let _ = Text::with_text_style(
-        &version,
-        Point::new(SCREEN_W as i32 / 2, 152),
-        version_style,
-        top,
-    )
-    .draw(display);
-}
-
 
 fn draw_panel<D: DrawTarget<Color = Rgb565>>(
     display: &mut D,
@@ -1330,10 +1101,10 @@ fn draw_bat<D: DrawTarget<Color = Rgb565>>(
             }
         };
 
-    draw_panel(display, x, y, w as u32, 40, COL_PANEL, COL_BORDER_DIM);
+    draw_panel(display, x, y, w as u32, 46, COL_PANEL, COL_BORDER_DIM);
 
     let title = MonoTextStyle::new(&FONT_6X10, COL_MUTED);
-    let percent = MonoTextStyle::new(&FONT_10X20, col);
+    let percent = MonoTextStyle::new(&FONT_9X15, col);
     let top = TextStyleBuilder::new().baseline(Baseline::Top).build();
     let tr = TextStyleBuilder::new()
         .alignment(Alignment::Right)
