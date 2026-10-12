@@ -10,10 +10,15 @@
 //!
 //! Every zone, colour and the connection indicator are driven by the runtime
 //! settings stored in `crate::layer_names` (Vial device settings, QSID
-//! 216..=226 / 318 / 320..=322 / 330..=332). The palette, the software
+//! 216..=228 / 318 / 320..=322 / 330..=332). The palette, the software
 //! brightness and the idle blanking are applied to the finished stripe, so the
 //! UI code always draws with the original constants and a device that never
 //! stored settings renders exactly the pre-settings frame.
+//!
+//! QSID 228 selects the **screen concept**: `0` is the dashboard above, `1..=10`
+//! switch the whole panel to one of the alternative layouts ported from the
+//! preview stand (`work/qube-preview/src/concepts.rs`). Concept screens paint
+//! the full frame, so they always repaint the whole panel.
 //!
 //! Pinout (`qube.overlay`):
 //! SPI3 SCK=P1.11 MOSI=P1.10 · CS=P1.13 · DC=P0.28 · RST=P0.03 · BL=P0.02
@@ -55,8 +60,12 @@ use rmk_types::connection::{ConnectionStatus, ConnectionType};
 use static_cell::StaticCell;
 
 use crate::layer_names::{
-    self, ScreenSettings, BATTERY_LABEL_MAX, DEFAULT_ACCENT, DEFAULT_ACCENT_DIM,
-    DEFAULT_BACKGROUND, SCREEN_BRIGHTNESS_MAX, SCREEN_HEADER_CLOCK, SCREEN_HEADER_MEDIA,
+    self, ScreenSettings, BATTERY_LABEL_MAX, SCREEN_BRIGHTNESS_MAX, SCREEN_HEADER_CLOCK,
+    SCREEN_HEADER_MEDIA,
+    SCREEN_CONCEPT_BATTILES, SCREEN_CONCEPT_BOARD, SCREEN_CONCEPT_DASHBOARD, SCREEN_CONCEPT_HUD,
+    SCREEN_CONCEPT_INFOCENTER, SCREEN_CONCEPT_MAX, SCREEN_CONCEPT_MEDIACENTER,
+    SCREEN_CONCEPT_MINIMAL, SCREEN_CONCEPT_MOOD, SCREEN_CONCEPT_SIGNAL, SCREEN_CONCEPT_SPARKLINE,
+    SCREEN_CONCEPT_SPEEDO, SCREEN_CONCEPT_TERMINAL, SCREEN_CONCEPT_TILES, SCREEN_CONCEPT_TWOCOL,
     SCREEN_OUTPUT_CHIP, SCREEN_OUTPUT_HEADER,
 };
 
@@ -80,6 +89,8 @@ const SAFE_W: u32 = SCREEN_W as u32 - (SAFE_X as u32 * 2);
 const MEDIA_GAP_CHARS: usize = 3;
 /// Badge text buffer: `USB` / `BTn` / `BTn*` / `BTn~` / `---`.
 const OUTPUT_BADGE_CHARS: usize = 4;
+/// Media ticker: one character every 300 ms, three blanks between passes.
+const MEDIA_MARQUEE_STEP_MS: u64 = 300;
 /// Sixth chip slot of the modifier row (connection badge when placed here).
 const BADGE_CHIP_X: i32 = 216;
 const BADGE_CHIP_W: u32 = 38;
@@ -298,28 +309,210 @@ const COL_PANEL_HI: Rgb565 = Rgb565::new(3, 9, 13);
 const COL_BORDER: Rgb565 = Rgb565::new(5, 13, 16);
 const COL_BORDER_DIM: Rgb565 = Rgb565::new(3, 8, 11);
 
-// --- Settings-driven look ---------------------------------------------------
+// --- Runtime palette --------------------------------------------------------
+//
+// The UI keeps drawing with the constants below. The panel post-pass then
+// rewrites every pixel whose value is one of those constants into the colour
+// configured for that role (`QSID 224..250` / `320..332`), so:
+//
+// * a device that never stored colours paints exactly the previous frame — the
+//   factory palette is the identity (asserted at compile time below and checked
+//   frame by frame in the host harness);
+// * a configured palette recolours the dashboard *and* every concept, because
+//   the substitution happens on the finished stripe.
+//
+// Roles the colour settings do not name directly (the lighter panel shade, the
+// dimmer caption, the "good" green of the battery and the connection badge …)
+// are the configured base colour shifted per channel by the exact offset the two
+// factory constants had. Offsets keep the family relationships sensible for a
+// custom palette and reproduce the factory one bit for bit.
 
-/// Raw RGB565 of the pre-settings palette entries. `DEFAULT_*` from
-/// `layer_names` are the 8-bit expansions of exactly these values, so the
-/// factory settings rebuild the original colours (checked at compile time).
-const COL_ACCENT_RAW: u16 = (3 << 11) | (38 << 5) | 31;
-const COL_ACCENT_DIM_RAW: u16 = (1 << 11) | (16 << 5) | 18;
-const COL_BG_RAW: u16 = (2 << 5) | 4;
-
-const fn rgb8_to_raw565(color: [u8; 3]) -> u16 {
-    (((color[0] >> 3) as u16) << 11)
-        | (((color[1] >> 2) as u16) << 5)
-        | ((color[2] >> 3) as u16)
+/// Raw RGB565 of a colour, available at compile time (`Rgb565::into_storage` is
+/// not a `const fn` in embedded-graphics 0.8).
+const fn raw565(r: u8, g: u8, b: u8) -> u16 {
+    ((r as u16 & 0x1F) << 11) | ((g as u16 & 0x3F) << 5) | (b as u16 & 0x1F)
 }
 
-const _: () = assert!(rgb8_to_raw565(DEFAULT_ACCENT) == COL_ACCENT_RAW);
-const _: () = assert!(rgb8_to_raw565(DEFAULT_ACCENT_DIM) == COL_ACCENT_DIM_RAW);
-const _: () = assert!(rgb8_to_raw565(DEFAULT_BACKGROUND) == COL_BG_RAW);
+/// Raw RGB565 of every factory colour the UI draws with, in the same order the
+/// constants are declared above.
+const COL_BG_RAW: u16 = raw565(0, 2, 4);
+const COL_PANEL_RAW: u16 = raw565(2, 6, 9);
+const COL_PANEL_HI_RAW: u16 = raw565(3, 9, 13);
+const COL_BORDER_RAW: u16 = raw565(5, 13, 16);
+const COL_BORDER_DIM_RAW: u16 = raw565(3, 8, 11);
+const COL_FG_RAW: u16 = raw565(29, 61, 30);
+const COL_MUTED_RAW: u16 = raw565(11, 24, 20);
+const COL_LABEL_RAW: u16 = raw565(16, 36, 28);
+const COL_DIM_RAW: u16 = raw565(5, 12, 14);
+const COL_ACCENT_RAW: u16 = raw565(3, 38, 31);
+const COL_ACCENT_DIM_RAW: u16 = raw565(1, 16, 18);
+const COL_YELLOW_RAW: u16 = raw565(31, 50, 0);
+const COL_RED_RAW: u16 = raw565(31, 5, 5);
+const COL_BAR_BG_RAW: u16 = raw565(2, 7, 9);
+const COL_BAR_FG_RAW: u16 = raw565(3, 42, 30);
+const COL_OUTPUT_OK_RAW: u16 = raw565(4, 46, 12);
+const COL_OUTPUT_SEARCH_RAW: u16 = raw565(4, 24, 31);
+const C_OK_RAW: u16 = raw565(6, 50, 10);
+const C_TERM_RAW: u16 = raw565(4, 56, 10);
 
-fn rgb565_from_rgb8(color: [u8; 3]) -> Rgb565 {
-    Rgb565::new(color[0] >> 3, color[1] >> 2, color[2] >> 3)
+const fn clamp_channel(value: i32, max: i32) -> u16 {
+    (if value < 0 {
+        0
+    } else if value > max {
+        max
+    } else {
+        value
+    }) as u16
 }
+
+/// Shifts every channel of `raw` by `offset`, saturating at the 5/6/5 limits.
+const fn shift_raw(raw: u16, offset: (i8, i8, i8)) -> u16 {
+    let r = clamp_channel(((raw >> 11) & 0x1F) as i32 + offset.0 as i32, 31);
+    let g = clamp_channel(((raw >> 5) & 0x3F) as i32 + offset.1 as i32, 63);
+    let b = clamp_channel((raw & 0x1F) as i32 + offset.2 as i32, 31);
+    (r << 11) | (g << 5) | b
+}
+
+/// Per-channel difference between two factory colours: the shade offsets below
+/// are read off the old palette, so nothing is hand-tuned twice.
+const fn shift_of(base: u16, target: u16) -> (i8, i8, i8) {
+    (
+        (((target >> 11) & 0x1F) as i32 - ((base >> 11) & 0x1F) as i32) as i8,
+        (((target >> 5) & 0x3F) as i32 - ((base >> 5) & 0x3F) as i32) as i8,
+        ((target & 0x1F) as i32 - (base & 0x1F) as i32) as i8,
+    )
+}
+
+const PANEL_HI_OFFSET: (i8, i8, i8) = shift_of(COL_PANEL_RAW, COL_PANEL_HI_RAW);
+const BORDER_DIM_OFFSET: (i8, i8, i8) = shift_of(COL_BORDER_RAW, COL_BORDER_DIM_RAW);
+const LABEL_HI_OFFSET: (i8, i8, i8) = shift_of(COL_MUTED_RAW, COL_LABEL_RAW);
+const LABEL_DIM_OFFSET: (i8, i8, i8) = shift_of(COL_MUTED_RAW, COL_DIM_RAW);
+const BAR_BG_OFFSET: (i8, i8, i8) = shift_of(COL_PANEL_RAW, COL_BAR_BG_RAW);
+const BATTERY_OK_OFFSET: (i8, i8, i8) = shift_of(COL_BAR_FG_RAW, C_OK_RAW);
+const OUTPUT_OK_OFFSET: (i8, i8, i8) = shift_of(COL_BAR_FG_RAW, COL_OUTPUT_OK_RAW);
+const OUTPUT_SEARCH_OFFSET: (i8, i8, i8) = shift_of(COL_ACCENT_RAW, COL_OUTPUT_SEARCH_RAW);
+const TERMINAL_OFFSET: (i8, i8, i8) = shift_of(COL_BAR_FG_RAW, C_TERM_RAW);
+
+/// Palette of the finished frame: every role the UI can draw with, in RGB565.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Palette {
+    background: u16,
+    panel: u16,
+    panel_hi: u16,
+    border: u16,
+    border_dim: u16,
+    ink: u16,
+    label: u16,
+    label_hi: u16,
+    dim: u16,
+    accent: u16,
+    accent_dim: u16,
+    bar: u16,
+    bar_bg: u16,
+    warn: u16,
+    bad: u16,
+    battery_ok: u16,
+    output_ok: u16,
+    output_search: u16,
+    terminal: u16,
+}
+
+impl Palette {
+    /// `colors` are the ten configured words in `layer_names::COLOR_ROLES`
+    /// order: accent, accent shadow, background, panel, border, text, label,
+    /// bar, warning, critical.
+    const fn from_colors(colors: [u16; layer_names::COLOR_COUNT]) -> Self {
+        let panel = colors[3];
+        let border = colors[4];
+        let label = colors[6];
+        let bar = colors[7];
+        Self {
+            background: colors[2],
+            panel,
+            panel_hi: shift_raw(panel, PANEL_HI_OFFSET),
+            border,
+            border_dim: shift_raw(border, BORDER_DIM_OFFSET),
+            ink: colors[5],
+            label,
+            label_hi: shift_raw(label, LABEL_HI_OFFSET),
+            dim: shift_raw(label, LABEL_DIM_OFFSET),
+            accent: colors[0],
+            accent_dim: colors[1],
+            bar,
+            bar_bg: shift_raw(panel, BAR_BG_OFFSET),
+            warn: colors[8],
+            bad: colors[9],
+            battery_ok: shift_raw(bar, BATTERY_OK_OFFSET),
+            output_ok: shift_raw(bar, OUTPUT_OK_OFFSET),
+            output_search: shift_raw(colors[0], OUTPUT_SEARCH_OFFSET),
+            terminal: shift_raw(bar, TERMINAL_OFFSET),
+        }
+    }
+
+    fn from_settings(settings: &ScreenSettings) -> Self {
+        Self::from_colors(settings.colors)
+    }
+
+    /// Replaces a colour the UI drew with by its configured value. Anything the
+    /// palette does not name (pure black of the terminal screen) passes through.
+    const fn remap(&self, raw: u16) -> u16 {
+        match raw {
+            COL_BG_RAW => self.background,
+            COL_PANEL_RAW => self.panel,
+            COL_PANEL_HI_RAW => self.panel_hi,
+            COL_BORDER_RAW => self.border,
+            COL_BORDER_DIM_RAW => self.border_dim,
+            COL_FG_RAW => self.ink,
+            COL_MUTED_RAW => self.label,
+            COL_LABEL_RAW => self.label_hi,
+            COL_DIM_RAW => self.dim,
+            COL_ACCENT_RAW => self.accent,
+            COL_ACCENT_DIM_RAW => self.accent_dim,
+            COL_BAR_FG_RAW => self.bar,
+            COL_BAR_BG_RAW => self.bar_bg,
+            COL_YELLOW_RAW => self.warn,
+            COL_RED_RAW => self.bad,
+            C_OK_RAW => self.battery_ok,
+            COL_OUTPUT_OK_RAW => self.output_ok,
+            COL_OUTPUT_SEARCH_RAW => self.output_search,
+            C_TERM_RAW => self.terminal,
+            other => other,
+        }
+    }
+}
+
+/// The factory palette must be the identity: a device that never stored colours
+/// has to paint exactly the frame it painted before the settings existed.
+const FACTORY_PALETTE: Palette = Palette::from_colors(layer_names::DEFAULT_COLORS);
+const _: () = assert!(layer_names::DEFAULT_COLORS[0] == COL_ACCENT_RAW);
+const _: () = assert!(layer_names::DEFAULT_COLORS[1] == COL_ACCENT_DIM_RAW);
+const _: () = assert!(layer_names::DEFAULT_COLORS[2] == COL_BG_RAW);
+const _: () = assert!(layer_names::DEFAULT_COLORS[3] == COL_PANEL_RAW);
+const _: () = assert!(layer_names::DEFAULT_COLORS[4] == COL_BORDER_RAW);
+const _: () = assert!(layer_names::DEFAULT_COLORS[5] == COL_FG_RAW);
+const _: () = assert!(layer_names::DEFAULT_COLORS[6] == COL_MUTED_RAW);
+const _: () = assert!(layer_names::DEFAULT_COLORS[7] == COL_BAR_FG_RAW);
+const _: () = assert!(layer_names::DEFAULT_COLORS[8] == COL_YELLOW_RAW);
+const _: () = assert!(layer_names::DEFAULT_COLORS[9] == COL_RED_RAW);
+const _: () = assert!(FACTORY_PALETTE.background == COL_BG_RAW);
+const _: () = assert!(FACTORY_PALETTE.panel == COL_PANEL_RAW);
+const _: () = assert!(FACTORY_PALETTE.panel_hi == COL_PANEL_HI_RAW);
+const _: () = assert!(FACTORY_PALETTE.border == COL_BORDER_RAW);
+const _: () = assert!(FACTORY_PALETTE.border_dim == COL_BORDER_DIM_RAW);
+const _: () = assert!(FACTORY_PALETTE.ink == COL_FG_RAW);
+const _: () = assert!(FACTORY_PALETTE.label == COL_MUTED_RAW);
+const _: () = assert!(FACTORY_PALETTE.label_hi == COL_LABEL_RAW);
+const _: () = assert!(FACTORY_PALETTE.dim == COL_DIM_RAW);
+const _: () = assert!(FACTORY_PALETTE.accent == COL_ACCENT_RAW);
+const _: () = assert!(FACTORY_PALETTE.accent_dim == COL_ACCENT_DIM_RAW);
+const _: () = assert!(FACTORY_PALETTE.bar == COL_BAR_FG_RAW);
+const _: () = assert!(FACTORY_PALETTE.bar_bg == COL_BAR_BG_RAW);
+const _: () = assert!(FACTORY_PALETTE.warn == COL_YELLOW_RAW);
+const _: () = assert!(FACTORY_PALETTE.bad == COL_RED_RAW);
+const _: () = assert!(FACTORY_PALETTE.battery_ok == C_OK_RAW);
+const _: () = assert!(FACTORY_PALETTE.output_ok == COL_OUTPUT_OK_RAW);
+const _: () = assert!(FACTORY_PALETTE.output_search == COL_OUTPUT_SEARCH_RAW);
+const _: () = assert!(FACTORY_PALETTE.terminal == C_TERM_RAW);
 
 /// Connection indicator colours: green = active transport, blue = searching or
 /// reconnecting, grey = the dongle is not talking to anything.
@@ -404,9 +597,7 @@ impl OutputState {
 /// and the idle blank. Same maths the host stand applies to its PNGs.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Look {
-    accent: Rgb565,
-    accent_dim: Rgb565,
-    background: Rgb565,
+    palette: Palette,
     brightness: u8,
     blank: bool,
 }
@@ -414,32 +605,23 @@ struct Look {
 impl Look {
     fn from_settings(settings: &ScreenSettings, blank: bool) -> Self {
         Self {
-            accent: rgb565_from_rgb8(settings.accent),
-            accent_dim: rgb565_from_rgb8(settings.accent_dim),
-            background: rgb565_from_rgb8(settings.background),
+            palette: Palette::from_settings(settings),
             brightness: settings.brightness.min(SCREEN_BRIGHTNESS_MAX),
             blank,
         }
     }
 }
 
-/// Rewrites one RGB565 pixel: the three palette entries the UI draws with are
-/// replaced by the configured colours, every component is scaled by the
-/// brightness setting, and a blanked screen becomes black. The panel driver
-/// applies this to each finished stripe.
+/// Rewrites one RGB565 pixel: every factory colour the UI draws with is replaced
+/// by the configured one, every component is scaled by the brightness setting,
+/// and a blanked screen becomes black. The panel driver applies this to each
+/// finished stripe, which is why the setting reaches the dashboard and all ten
+/// concepts without touching a single drawing call.
 fn look_pixel(raw: u16, look: &Look) -> u16 {
     if look.blank {
         return 0;
     }
-    let mut raw = if raw == COL_ACCENT_RAW {
-        look.accent.into_storage()
-    } else if raw == COL_ACCENT_DIM_RAW {
-        look.accent_dim.into_storage()
-    } else if raw == COL_BG_RAW {
-        look.background.into_storage()
-    } else {
-        raw
-    };
+    let mut raw = look.palette.remap(raw);
     let scale = look.brightness.min(SCREEN_BRIGHTNESS_MAX) as u32;
     if scale < SCREEN_BRIGHTNESS_MAX as u32 {
         let r5 = ((raw >> 11) & 0x1F) as u32 * scale / 100;
@@ -1081,7 +1263,10 @@ where
     }
 
     async fn redraw_modifiers(&mut self) {
-        if self.blanked || self.modifier_redraw_wait() != Duration::MIN {
+        if self.blanked || self.concept_active() || self.modifier_redraw_wait() != Duration::MIN {
+            if self.concept_active() {
+                self.modifier_pending = false;
+            }
             return;
         }
         let Some(band) = self.renderer.layout().modifiers else {
@@ -1101,12 +1286,29 @@ where
         self.dirty = DirtyRegion::Full;
     }
 
+    /// A concept screen is one whole-panel layout, so it is never repainted band
+    /// by band: every partial request is widened to the full frame. Without this
+    /// a layer or battery change would repaint one band and leave the rest of
+    /// the previous concept on the glass.
+    fn concept_active(&self) -> bool {
+        self.renderer.settings.concept != SCREEN_CONCEPT_DASHBOARD
+    }
+
     fn request_redraw_region(&mut self, dirty: DirtyRegion) {
+        let dirty = if self.concept_active() {
+            concept_dirty()
+        } else {
+            dirty
+        };
         self.dirty = if self.pending { self.dirty.union(dirty) } else { dirty };
         self.pending = true;
     }
 
     fn request_modifier_redraw(&mut self) {
+        if self.concept_active() {
+            self.request_redraw();
+            return;
+        }
         self.modifier_pending = true;
     }
 
@@ -1548,6 +1750,16 @@ pub struct QubeStatusRenderer {
     connection: ConnectionStatus,
     /// Last `BleAdvertisingModeEvent`, used to tell pairing from reconnecting.
     advertising: Option<BleAdvertisingMode>,
+    /// Ring buffer with the last [`WPM_HISTORY_LEN`] WPM samples: `sparkline`
+    /// draws it, nothing else reads it.
+    wpm_history: [u8; WPM_HISTORY_LEN],
+    /// Slot the next sample overwrites — the oldest sample while the buffer is
+    /// not full yet, which is what `wpm_history_ordered` relies on.
+    wpm_history_head: usize,
+    /// Value of the newest sample, so the buffer only moves on a real change.
+    last_wpm: u8,
+    /// One debounce per half: the raw split stream wobbles by ±1 pp.
+    battery_smoother: [BatterySmoother; 2],
 }
 
 impl QubeStatusRenderer {
@@ -1558,6 +1770,128 @@ impl QubeStatusRenderer {
             settings: layer_names::screen_settings(),
             connection: ConnectionStatus::default(),
             advertising: None,
+            wpm_history: [0; WPM_HISTORY_LEN],
+            wpm_history_head: 0,
+            last_wpm: 0,
+            battery_smoother: [BatterySmoother::new(), BatterySmoother::new()],
+        }
+    }
+
+    /// Debounced battery readings of this frame, one per half. Every consumer
+    /// (dashboard cards, concept digits and their bars) goes through here, so the
+    /// number and the fill can never disagree.
+    fn smoothed_batteries(&mut self, ctx: &RenderContext) -> [BatReading; 2] {
+        let mut out = [BatReading::Unknown; 2];
+        for (index, slot) in out.iter_mut().enumerate() {
+            let raw = battery_reading(ctx.peripheral_batteries.get(index).map(|b| b.0));
+            let percent = match raw {
+                BatReading::Pct(pct) => Some(pct),
+                _ => None,
+            };
+            *slot = match self.battery_smoother[index].update(percent) {
+                Some(pct) => BatReading::Pct(pct),
+                // `--` / `??` / "no data" stay exactly what the event said.
+                None => raw,
+            };
+        }
+        out
+    }
+
+    /// Records one WPM sample, oldest-first semantics: the ring buffer keeps
+    /// the last [`WPM_HISTORY_LEN`] distinct values.
+    fn note_wpm(&mut self, wpm: u16) {
+        let value = wpm.min(u8::MAX as u16) as u8;
+        if value == self.last_wpm {
+            return;
+        }
+        self.last_wpm = value;
+        self.wpm_history[self.wpm_history_head] = value;
+        self.wpm_history_head = (self.wpm_history_head + 1) % WPM_HISTORY_LEN;
+    }
+
+    /// Chronological view of the ring buffer (oldest first), which is the order
+    /// `sparkline` paints.
+    fn wpm_history_ordered(&self, out: &mut [u8; WPM_HISTORY_LEN]) {
+        for (index, slot) in out.iter_mut().enumerate() {
+            *slot = self.wpm_history[(self.wpm_history_head + index) % WPM_HISTORY_LEN];
+        }
+    }
+
+    /// Everything a concept screen may read, in one owning snapshot: the
+    /// buffers live on the stack (no heap), and every flag comes from the same
+    /// `ScreenSettings` the dashboard uses.
+    fn concept_state(&mut self, ctx: &RenderContext, settings: &ScreenSettings) -> ConceptState {
+        let mut name_buf = [0u8; layer_names::LAYER_NAME_MAX];
+        let mut name: heapless::String<CONCEPT_NAME_MAX> = heapless::String::new();
+        let _ = name.push_str(
+            layer_names::copy_layer_name(ctx.layer, &mut name_buf)
+                .and_then(|len| core::str::from_utf8(&name_buf[..len]).ok())
+                .unwrap_or_else(|| layer_name(ctx.layer)),
+        );
+
+        let mut media: heapless::String<CONCEPT_MEDIA_MAX> = heapless::String::new();
+        push_media_label(&mut media, &self.host_data);
+        // Phase of the media ticker: the concept bars scroll with the same
+        // 300 ms step as the dashboard header.
+        let media_offset = media_marquee_offset(media.len());
+
+        let mut history = [0u8; WPM_HISTORY_LEN];
+        self.wpm_history_ordered(&mut history);
+
+        // Same packing the preview stand used: bit0/1 ctrl, bit2/3 shift,
+        // bit4/5 alt, bit6/7 gui (left, then right).
+        let modifiers = ctx.modifiers;
+        let mut mods = 0u8;
+        mods |= u8::from(modifiers.left_ctrl());
+        mods |= u8::from(modifiers.right_ctrl()) << 1;
+        mods |= u8::from(modifiers.left_shift()) << 2;
+        mods |= u8::from(modifiers.right_shift()) << 3;
+        mods |= u8::from(modifiers.left_alt()) << 4;
+        mods |= u8::from(modifiers.right_alt()) << 5;
+        mods |= u8::from(modifiers.left_gui()) << 6;
+        mods |= u8::from(modifiers.right_gui()) << 7;
+
+        let level = |reading: BatReading| match reading {
+            BatReading::Pct(pct) => Some(pct),
+            _ => None,
+        };
+        let left = ctx.peripherals_connected.first().copied().unwrap_or(false);
+        let right = ctx.peripherals_connected.get(1).copied().unwrap_or(false);
+        // Debounced: the halves re-publish a ±1 pp wobbling sample every 2 s.
+        let smoothed = self.smoothed_batteries(ctx);
+        let batteries = [
+            (level(smoothed[0]), left),
+            (level(smoothed[1]), right),
+        ];
+
+        ConceptState {
+            layer: ctx.layer,
+            name,
+            wpm: ctx.wpm,
+            mods,
+            caps_lock: ctx.caps_lock,
+            num_lock: ctx.num_lock,
+            link: OutputState::from_connection(&self.connection, self.advertising),
+            link_profile: self.connection.ble.profile,
+            batteries,
+            hour: self.host_data.hour,
+            minute: self.host_data.minute,
+            // The pinned RMK host protocol carries hour/minute only
+            // (`rmk::host_data::HostData`), so there is no date to show.
+            date: None,
+            media,
+            media_offset,
+            sleeping: ctx.sleeping,
+            wpm_history: history,
+            show_wpm: settings.wpm_visible,
+            show_modifiers: settings.show_modifiers,
+            show_batteries: settings.show_batteries,
+            show_clock: settings.shows_clock(),
+            show_media: settings.shows_media(),
+            show_output: settings.output_visible,
+            compact_output: settings.output_place == SCREEN_OUTPUT_CHIP,
+            left_label: settings.left_label,
+            right_label: settings.right_label,
         }
     }
 
@@ -1580,6 +1914,12 @@ impl QubeStatusRenderer {
         }
         let mut media: heapless::String<72> = heapless::String::new();
         push_media_label(&mut media, &self.host_data);
+        // Concept screens draw the ticker themselves; only `speedo` scrolls it,
+        // and with a wider window than the dashboard header.
+        if self.settings.concept.min(SCREEN_CONCEPT_MAX) != SCREEN_CONCEPT_DASHBOARD {
+            return self.settings.concept.min(SCREEN_CONCEPT_MAX) == SCREEN_CONCEPT_SPEEDO
+                && media.chars().count() > SPEEDO_MEDIA_CHARS;
+        }
         media.len() > self.geometry().media_limit
     }
 
@@ -1663,9 +2003,19 @@ impl DisplayRenderer<Rgb565> for QubeStatusRenderer {
             return;
         }
 
+        // Concept screens (QSID 228) replace the dashboard entirely: they read
+        // the same settings, so hiding WPM / modifiers / batteries, the header
+        // mode, the badge placement and the battery labels all still apply.
+        self.note_wpm(ctx.wpm);
+        let settings = self.settings;
+        if settings.concept.min(SCREEN_CONCEPT_MAX) != SCREEN_CONCEPT_DASHBOARD {
+            let state = self.concept_state(ctx, &settings);
+            render_concept(display, settings.concept.min(SCREEN_CONCEPT_MAX), &state);
+            return;
+        }
+
         let layout = self.layout();
         let geo = self.geometry();
-        let settings = self.settings;
         let layer_meta = MonoTextStyle::new(&FONT_6X10, COL_LABEL);
         let header_media = MonoTextStyle::new(&FONT_6X10, COL_FG);
         let header_fallback = MonoTextStyle::new(&FONT_8X13, COL_ACCENT);
@@ -1678,8 +2028,10 @@ impl DisplayRenderer<Rgb565> for QubeStatusRenderer {
             .build();
         let left = ctx.peripherals_connected.first().copied().unwrap_or(false);
         let right = ctx.peripherals_connected.get(1).copied().unwrap_or(false);
-        let lp = battery_reading(ctx.peripheral_batteries.first().map(|b| b.0));
-        let rp = battery_reading(ctx.peripheral_batteries.get(1).map(|b| b.0));
+        // Debounced: the raw split stream wobbles by ±1 pp every 2 s.
+        let smoothed = self.smoothed_batteries(ctx);
+        let lp = smoothed[0];
+        let rp = smoothed[1];
         let mut custom_name = [0u8; layer_names::LAYER_NAME_MAX];
         let name = layer_names::copy_layer_name(ctx.layer, &mut custom_name)
             .and_then(|len| core::str::from_utf8(&custom_name[..len]).ok())
@@ -1959,6 +2311,77 @@ fn battery_reading(status: Option<BatteryStatus>) -> BatReading {
     }
 }
 
+// --- Battery display smoothing ----------------------------------------------
+//
+// The halves publish a freshly sampled percentage every 2 s and their SAADC
+// runs without `calibrate().await` (see `keyboards/classic_qube/src/battery_nrf.rs`),
+// so the raw value wobbles by ±1 pp around the real level and every event used
+// to repaint the digits. The display therefore averages the last few samples and
+// only follows the average once it is clearly away from what is on the glass.
+//
+// 4 samples ≈ 8 s of history: enough to cut uncorrelated ±1 pp jitter roughly in
+// half (√4), short enough that a real drop is fully shown within one window.
+const BATTERY_WINDOW: usize = 4;
+/// Dead band of the shown value, in tenths of a percent: 15 = 1.5 pp. A wobble
+/// of the average by a couple of tenths never repaints the digit, while a real
+/// 1 pp drift — or the ramp of a bigger drop — still lands.
+const BATTERY_HYSTERESIS_TENTHS: i32 = 15;
+
+/// Debounce of one half's displayed percentage.
+///
+/// `None` means "no usable number right now" — the half is not connected, or it
+/// is connected but has not reported a level yet. Such states pass through
+/// untouched (the renderers draw `--` / `??`), while the history is kept, so the
+/// number comes back smoothly instead of jumping to a stray sample.
+struct BatterySmoother {
+    /// Ring of the last [`BATTERY_WINDOW`] raw samples, one per heartbeat.
+    window: [u8; BATTERY_WINDOW],
+    /// Filled slots; the ring warms up over the first few samples.
+    filled: usize,
+    head: usize,
+    /// Percentage currently on the glass, `None` while a half shows `--`/`??`.
+    shown: Option<u8>,
+}
+
+impl BatterySmoother {
+    const fn new() -> Self {
+        Self {
+            window: [0; BATTERY_WINDOW],
+            filled: 0,
+            head: 0,
+            shown: None,
+        }
+    }
+
+    fn update(&mut self, reading: Option<u8>) -> Option<u8> {
+        let Some(value) = reading else {
+            // "no data" / "??": keep the history, report "no number".
+            return None;
+        };
+
+        self.window[self.head] = value;
+        self.head = (self.head + 1) % BATTERY_WINDOW;
+        if self.filled < BATTERY_WINDOW {
+            self.filled += 1;
+        }
+
+        let sum: u32 = self.window[..self.filled].iter().map(|v| u32::from(*v)).sum();
+        let average_tenths = (sum * 10 / self.filled as u32).min(1000) as i32;
+
+        match self.shown {
+            // First number after power-up or after a `--`/`??` stretch: show it,
+            // no need to wait for a full window.
+            None => self.shown = Some((average_tenths / 10) as u8),
+            Some(shown) => {
+                if (average_tenths - i32::from(shown) * 10).abs() >= BATTERY_HYSTERESIS_TENTHS {
+                    self.shown = Some((average_tenths / 10) as u8);
+                }
+            }
+        }
+        self.shown
+    }
+}
+
 /// Width of the value text `draw_bat` right-aligns: `--`, `??` or `NN%`.
 fn battery_value_len(reading: BatReading, connected: bool) -> usize {
     match (connected, reading) {
@@ -2194,10 +2617,7 @@ fn draw_media_or_fallback<D: DrawTarget<Color = Rgb565>>(
     if media.chars().count() <= visible_chars {
         let _ = visible.push_str(&media);
     } else {
-        let elapsed = Instant::now()
-            .duration_since(Instant::from_ticks(0))
-            .as_millis() as usize;
-        let offset = (elapsed / 300) % (media.len() + MEDIA_GAP_CHARS);
+        let offset = media_marquee_offset(media.len());
         push_marquee_slice(&mut visible, &media, offset, visible_chars);
     }
 
@@ -2230,8 +2650,17 @@ fn push_ascii_text<const N: usize>(buffer: &mut heapless::String<N>, value: &str
     }
 }
 
-fn push_marquee_slice(
-    buffer: &mut heapless::String<32>,
+/// Current offset of the media ticker, in characters. Both the dashboard header
+/// and the concept bars use this, so the step never differs between screens.
+fn media_marquee_offset(len: usize) -> usize {
+    let elapsed = Instant::now()
+        .duration_since(Instant::from_ticks(0))
+        .as_millis() as usize;
+    (elapsed / MEDIA_MARQUEE_STEP_MS as usize) % (len + MEDIA_GAP_CHARS)
+}
+
+fn push_marquee_slice<const N: usize>(
+    buffer: &mut heapless::String<N>,
     text: &str,
     offset: usize,
     visible_chars: usize,
@@ -2251,4 +2680,1525 @@ fn push_marquee_slice(
 
 fn host_time_available(host_data: &rmk::host_data::HostData) -> bool {
     host_data.hour.is_some() && host_data.minute.is_some()
+}
+
+// --- Concept screens (QSID 228) ---------------------------------------------
+//
+// Ten alternative whole-panel layouts, ported from the preview stand
+// (`work/qube-preview/src/concepts.rs`): same primitives, same pixel
+// coordinates, same palette entries, so every frame can be compared with the
+// mock PNGs in `outputs/screen-preview/concepts`.
+//
+// A concept paints the whole 280×240 frame. `StripeLcd` clips each drawing call
+// to the active stripe, and a concept screen always walks every stripe
+// (`concept_dirty` / `DongleScreen::concept_active`), so the composite on the
+// glass is exactly one frame of the renderer below.
+
+/// WPM samples the `sparkline` concept draws (one bar each).
+pub const WPM_HISTORY_LEN: usize = 24;
+/// Layer-name buffer of a concept: the blob caps a name at 10 bytes, the stand's
+/// mock used 12.
+const CONCEPT_NAME_MAX: usize = 16;
+/// Buffer of `fit_name`: it also fits media titles (a 31-character title is
+/// truncated to 24 glyphs by the caller's pixel budget).
+const CONCEPT_FIT_MAX: usize = 40;
+/// Media buffer of a concept: `artist - title`, the dashboard's budget.
+const CONCEPT_MEDIA_MAX: usize = 72;
+
+/// Palette of the concept screens. Every entry is a dashboard constant, so the
+/// palette substitution, the brightness scaling and the idle blank of
+/// `look_pixel` apply to concept frames unchanged.
+pub const C_BG: Rgb565 = COL_BG;
+pub const C_PANEL: Rgb565 = COL_PANEL;
+pub const C_PANEL_HI: Rgb565 = COL_PANEL_HI;
+pub const C_BORDER: Rgb565 = COL_BORDER;
+pub const C_INK: Rgb565 = COL_FG;
+pub const C_DIM: Rgb565 = COL_MUTED;
+pub const C_ACCENT: Rgb565 = COL_ACCENT;
+pub const C_ACCENT_DIM: Rgb565 = COL_ACCENT_DIM;
+pub const C_OK: Rgb565 = Rgb565::new(6, 50, 10);
+pub const C_WARN: Rgb565 = COL_YELLOW;
+pub const C_BAD: Rgb565 = COL_RED;
+/// Phosphor green of the `terminal` concept (not palette-substituted).
+pub const C_TERM: Rgb565 = Rgb565::new(4, 56, 10);
+pub const C_BLACK: Rgb565 = Rgb565::new(0, 0, 0);
+
+/// Dirty region of a concept screen: the whole panel, cut from the same height
+/// the layout maths uses. A concept covers every row it draws, so a partial
+/// repaint is never enough.
+fn concept_dirty() -> DirtyRegion {
+    DirtyRegion::range(0, SCREEN_H as u16)
+}
+
+/// Everything the concept renderers may read; built by
+/// `QubeStatusRenderer::concept_state` once per frame.
+struct ConceptState {
+    layer: u8,
+    /// Layer name as stored (the blob caps it at `LAYER_NAME_MAX` bytes).
+    name: heapless::String<CONCEPT_NAME_MAX>,
+    wpm: u16,
+    /// Modifier bits, packed like the preview stand's `ConceptState::mods`:
+    /// bit0 left ctrl, bit1 right ctrl, bit2 left shift, bit3 right shift,
+    /// bit4 left alt, bit5 right alt, bit6 left gui, bit7 right gui.
+    mods: u8,
+    caps_lock: bool,
+    num_lock: bool,
+    link: OutputState,
+    /// Active BLE profile (0..=4), for the profile dots of `signal`.
+    link_profile: u8,
+    /// Per half: `(level, connected)`.
+    batteries: [(Option<u8>, bool); 2],
+    hour: Option<u8>,
+    minute: Option<u8>,
+    /// Host date; `None` while the RMK host protocol carries no date.
+    date: Option<&'static str>,
+    media: heapless::String<CONCEPT_MEDIA_MAX>,
+    /// Phase of the media ticker in characters (see [`media_marquee_offset`]).
+    media_offset: usize,
+    sleeping: bool,
+    /// Oldest-first WPM history, [`WPM_HISTORY_LEN`] samples.
+    wpm_history: [u8; WPM_HISTORY_LEN],
+    show_wpm: bool,
+    show_modifiers: bool,
+    show_batteries: bool,
+    show_clock: bool,
+    show_media: bool,
+    show_output: bool,
+    /// `QSID 227 = Chip row`: draw the compact (chip-sized) badge instead of the
+    /// decorated one the concept's own design uses.
+    compact_output: bool,
+    left_label: layer_names::BatteryLabel,
+    right_label: layer_names::BatteryLabel,
+}
+
+impl ConceptState {
+    /// `HH:MM`, or `--:--` when the host has not sent a time yet.
+    fn time(&self) -> heapless::String<16> {
+        let mut out: heapless::String<16> = heapless::String::new();
+        push_host_time(&mut out, self.hour, self.minute);
+        out
+    }
+
+    /// Badge text and colour for the current transport.
+    fn badge(&self) -> (heapless::String<OUTPUT_BADGE_CHARS>, Rgb565) {
+        self.link.badge()
+    }
+
+    fn bat(&self, index: usize) -> (Option<u8>, bool) {
+        self.batteries[index.min(1)]
+    }
+
+    /// Battery card label of one half (factory values are `LEFT` / `RIGHT`).
+    fn label(&self, index: usize) -> &str {
+        if index == 0 {
+            self.left_label.as_str()
+        } else {
+            self.right_label.as_str()
+        }
+    }
+
+    /// Single-letter form of the same label for the compact slots: `L` / `R`
+    /// with the factory labels, the configured first letter otherwise.
+    fn side(&self, index: usize) -> heapless::String<2> {
+        let mut out: heapless::String<2> = heapless::String::new();
+        let fallback = if index == 0 { 'L' } else { 'R' };
+        let _ = out.push(self.label(index).chars().next().unwrap_or(fallback));
+        out
+    }
+}
+
+// --- primitives (identical to the stand's concepts.rs) ----------------------
+
+fn cfill<D: DrawTarget<Color = Rgb565>>(d: &mut D, x: i32, y: i32, w: u32, h: u32, color: Rgb565) {
+    let _ = Rectangle::new(Point::new(x, y), Size::new(w, h))
+        .into_styled(PrimitiveStyle::with_fill(color))
+        .draw(d);
+}
+
+fn cframe<D: DrawTarget<Color = Rgb565>>(
+    d: &mut D,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    fill: Rgb565,
+    stroke: Rgb565,
+) {
+    let _ = RoundedRectangle::with_equal_corners(
+        Rectangle::new(Point::new(x, y), Size::new(w, h)),
+        Size::new(8, 8),
+    )
+    .into_styled(
+        PrimitiveStyleBuilder::new()
+            .fill_color(fill)
+            .stroke_color(stroke)
+            .stroke_width(1)
+            .build(),
+    )
+    .draw(d);
+}
+
+/// Hairline box (1 px stroke, no fill).
+fn cbox<D: DrawTarget<Color = Rgb565>>(d: &mut D, x: i32, y: i32, w: u32, h: u32, color: Rgb565) {
+    let _ = Rectangle::new(Point::new(x, y), Size::new(w, h))
+        .into_styled(PrimitiveStyle::with_stroke(color, 1))
+        .draw(d);
+}
+
+fn cline<D: DrawTarget<Color = Rgb565>>(d: &mut D, x: i32, y: i32, w: u32, color: Rgb565) {
+    cfill(d, x, y, w, 1, color);
+}
+
+fn ctext6<D: DrawTarget<Color = Rgb565>>(d: &mut D, text: &str, x: i32, y: i32, color: Rgb565) {
+    let _ = Text::with_text_style(
+        text,
+        Point::new(x, y),
+        MonoTextStyle::new(&FONT_6X10, color),
+        TextStyleBuilder::new().baseline(Baseline::Top).build(),
+    )
+    .draw(d);
+}
+
+fn ctext6r<D: DrawTarget<Color = Rgb565>>(d: &mut D, text: &str, x: i32, y: i32, color: Rgb565) {
+    let _ = Text::with_text_style(
+        text,
+        Point::new(x, y),
+        MonoTextStyle::new(&FONT_6X10, color),
+        TextStyleBuilder::new()
+            .alignment(Alignment::Right)
+            .baseline(Baseline::Top)
+            .build(),
+    )
+    .draw(d);
+}
+
+fn ctext6c<D: DrawTarget<Color = Rgb565>>(d: &mut D, text: &str, x: i32, y: i32, color: Rgb565) {
+    let _ = Text::with_text_style(
+        text,
+        Point::new(x, y),
+        MonoTextStyle::new(&FONT_6X10, color),
+        TextStyleBuilder::new()
+            .alignment(Alignment::Center)
+            .baseline(Baseline::Top)
+            .build(),
+    )
+    .draw(d);
+}
+
+fn ctext8<D: DrawTarget<Color = Rgb565>>(d: &mut D, text: &str, x: i32, y: i32, color: Rgb565) {
+    let _ = Text::with_text_style(
+        text,
+        Point::new(x, y),
+        MonoTextStyle::new(&FONT_8X13, color),
+        TextStyleBuilder::new().baseline(Baseline::Top).build(),
+    )
+    .draw(d);
+}
+
+fn ctext8c<D: DrawTarget<Color = Rgb565>>(d: &mut D, text: &str, x: i32, y: i32, color: Rgb565) {
+    let _ = Text::with_text_style(
+        text,
+        Point::new(x, y),
+        MonoTextStyle::new(&FONT_8X13, color),
+        TextStyleBuilder::new()
+            .alignment(Alignment::Center)
+            .baseline(Baseline::Top)
+            .build(),
+    )
+    .draw(d);
+}
+
+fn ctext8r<D: DrawTarget<Color = Rgb565>>(d: &mut D, text: &str, x: i32, y: i32, color: Rgb565) {
+    let _ = Text::with_text_style(
+        text,
+        Point::new(x, y),
+        MonoTextStyle::new(&FONT_8X13, color),
+        TextStyleBuilder::new()
+            .alignment(Alignment::Right)
+            .baseline(Baseline::Top)
+            .build(),
+    )
+    .draw(d);
+}
+
+/// `FONT_10X20`, `scale` 1 or 2. `align` anchors the text box.
+fn ctext20<D: DrawTarget<Color = Rgb565>>(
+    d: &mut D,
+    text: &str,
+    x: i32,
+    y: i32,
+    color: Rgb565,
+    align: Alignment,
+    scale: u32,
+) {
+    if scale == 2 {
+        draw_text_x2(
+            d,
+            text,
+            Point::new(x, y),
+            MonoTextStyle::new(&FONT_10X20, color),
+            align,
+        );
+    } else {
+        let mut style = TextStyleBuilder::new();
+        style = style.baseline(Baseline::Top).alignment(align);
+        let _ = Text::with_text_style(
+            text,
+            Point::new(x, y),
+            MonoTextStyle::new(&FONT_10X20, color),
+            style.build(),
+        )
+        .draw(d);
+    }
+}
+
+/// Horizontal progress bar with a 1 px frame.
+fn cbar<D: DrawTarget<Color = Rgb565>>(
+    d: &mut D,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    percent: u32,
+    fg: Rgb565,
+) {
+    cfill(d, x, y, w, h, C_PANEL_HI);
+    cbox(d, x, y, w, h, C_BORDER);
+    let inner = w.saturating_sub(4);
+    let fill_w = (inner * percent.min(100) / 100).max(if percent > 0 { 2 } else { 0 });
+    if fill_w > 0 {
+        cfill(d, x + 2, y + 2, fill_w, h.saturating_sub(4), fg);
+    }
+}
+
+// --- concept helpers --------------------------------------------------------
+
+fn battery_color(level: Option<u8>) -> Rgb565 {
+    match level {
+        Some(value) if value < 10 => C_BAD,
+        Some(value) if value < 25 => C_WARN,
+        Some(_) => C_OK,
+        None => C_DIM,
+    }
+}
+
+/// `--` (half not connected), `??` (no reading yet) or `NN%`.
+fn concept_battery_text(st: &ConceptState, index: usize) -> heapless::String<8> {
+    let (level, connected) = st.bat(index);
+    let mut value: heapless::String<8> = heapless::String::new();
+    if !connected {
+        let _ = value.push_str("--");
+    } else if let Some(level) = level {
+        let _ = write!(&mut value, "{}%", level);
+    } else {
+        let _ = value.push_str("??");
+    }
+    value
+}
+
+/// ASCII-modifier strip, the trick from englmaxi's `hid_indicators` ("CNS").
+fn cmods<D: DrawTarget<Color = Rgb565>>(d: &mut D, x: i32, y: i32, st: &ConceptState) {
+    let letters = [
+        ('C', st.mods & 0x03 != 0),
+        ('S', st.mods & 0x0C != 0),
+        ('A', st.mods & 0x30 != 0),
+        ('G', st.mods & 0xC0 != 0),
+        ('c', st.caps_lock),
+        ('n', st.num_lock),
+    ];
+    for (index, (letter, active)) in letters.iter().enumerate() {
+        let mut text: heapless::String<2> = heapless::String::new();
+        let _ = text.push(*letter);
+        ctext6(
+            d,
+            &text,
+            x + index as i32 * 10,
+            y,
+            if *active { C_INK } else { C_DIM },
+        );
+    }
+}
+
+/// Compact connection indicator: status dot plus badge text.
+fn badge_line<D: DrawTarget<Color = Rgb565>>(d: &mut D, x: i32, y: i32, st: &ConceptState) {
+    let (text, color) = st.badge();
+    cfill(d, x, y + 2, 4, 6, color);
+    ctext6(d, &text, x + 8, y, C_INK);
+}
+
+/// The concept-specific badge: a filled plate with dark text. With
+/// `QSID 227 = Chip row` it degrades to the compact [`badge_line`] form, so the
+/// placement setting is visible on concept screens too.
+fn badge_plate<D: DrawTarget<Color = Rgb565>>(
+    d: &mut D,
+    x: i32,
+    y: i32,
+    w: u32,
+    h: u32,
+    st: &ConceptState,
+) {
+    if st.compact_output {
+        badge_line(d, x, y, st);
+        return;
+    }
+    let (text, color) = st.badge();
+    cfill(d, x, y, w, h, color);
+    cbox(d, x, y, w, h, C_INK);
+    ctext8c(d, &text, x + w as i32 / 2, y + 6, C_BLACK);
+}
+
+fn bat_line<D: DrawTarget<Color = Rgb565>>(d: &mut D, x: i32, y: i32, st: &ConceptState) {
+    for index in 0..2 {
+        let (level, _) = st.bat(index);
+        let side = st.side(index);
+        let value = concept_battery_text(st, index);
+        ctext6(d, &side, x + index as i32 * 34, y, C_DIM);
+        ctext6(d, &value, x + 8 + index as i32 * 34, y, battery_color(level));
+    }
+}
+
+/// Fit a layer name into `avail` px: 2x, else 1x, else 1x with `..`.
+fn fit_name(name: &str, avail: i32) -> (heapless::String<CONCEPT_FIT_MAX>, u32) {
+    let mut out: heapless::String<CONCEPT_FIT_MAX> = heapless::String::new();
+    let len = name.chars().count() as i32;
+    if 2 * 10 * len <= avail {
+        let _ = out.push_str(name);
+        (out, 2)
+    } else if 10 * len <= avail {
+        let _ = out.push_str(name);
+        (out, 1)
+    } else {
+        let keep = ((avail - 2 * 10) / 10).max(1) as usize;
+        for ch in name.chars().take(keep) {
+            let _ = out.push(ch);
+        }
+        let _ = out.push_str("..");
+        (out, 1)
+    }
+}
+
+/// `text` cut to `chars` characters, with `..` when something was dropped.
+fn clipped<const N: usize>(text: &str, chars: usize) -> heapless::String<N> {
+    let total = text.chars().count();
+    let mut out: heapless::String<N> = heapless::String::new();
+    for ch in text.chars().take(chars) {
+        let _ = out.push(ch);
+    }
+    if out.chars().count() < total {
+        let _ = out.push_str("..");
+    }
+    out
+}
+
+/// Doubled-size text box width — the same maths as `draw_text_x2`, which is what
+/// `minimal` needs for its accent underline.
+fn c_x2_width(text: &str) -> i32 {
+    let advance = font_advance(&FONT_10X20);
+    let spacing = FONT_10X20.character_spacing as i32;
+    let glyphs = text.chars().count() as i32;
+    (glyphs * advance - spacing).max(0) * 2
+}
+
+fn scale_y(scale: u32, base: i32) -> i32 {
+    if scale == 2 {
+        base
+    } else {
+        base + 11
+    }
+}
+
+fn link_words(link: OutputState) -> &'static str {
+    match link {
+        OutputState::Usb => "usb wired",
+        OutputState::Ble { .. } => "bt connected",
+        OutputState::Pairing { .. } => "bt pairing",
+        OutputState::Reconnecting { .. } => "bt reconnecting",
+        OutputState::Idle => "no output",
+    }
+}
+
+/// Concept id → renderer. Ids are the `QSID 228` values; `0` (the dashboard) is
+/// handled by `QubeStatusRenderer::render` and never reaches this function.
+fn render_concept<D: DrawTarget<Color = Rgb565>>(display: &mut D, concept: u8, st: &ConceptState) {
+    match concept {
+        SCREEN_CONCEPT_HUD => render_concept_hud(display, st),
+        SCREEN_CONCEPT_TERMINAL => render_concept_terminal(display, st),
+        SCREEN_CONCEPT_MINIMAL => render_concept_minimal(display, st),
+        SCREEN_CONCEPT_TILES => render_concept_tiles(display, st),
+        SCREEN_CONCEPT_SPEEDO => render_concept_speedo(display, st),
+        SCREEN_CONCEPT_INFOCENTER => render_concept_infocenter(display, st),
+        SCREEN_CONCEPT_TWOCOL => render_concept_twocol(display, st),
+        SCREEN_CONCEPT_SPARKLINE => render_concept_sparkline(display, st),
+        SCREEN_CONCEPT_SIGNAL => render_concept_signal(display, st),
+        SCREEN_CONCEPT_MOOD => render_concept_mood(display, st),
+        SCREEN_CONCEPT_BATTILES => render_concept_battiles(display, st),
+        SCREEN_CONCEPT_MEDIACENTER => render_concept_mediacenter(display, st),
+        SCREEN_CONCEPT_BOARD => render_concept_board(display, st),
+        _ => {}
+    }
+}
+
+// --- the ten concepts -------------------------------------------------------
+
+/// 3. Minimal: layer name and clock, nothing else.
+fn render_concept_minimal<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptState) {
+    let _ = d.clear(C_BG);
+    let width = c_x2_width(st.name.as_str());
+    let (name, scale) = fit_name(st.name.as_str(), 250);
+    ctext20(d, &name, 140, 104, C_INK, Alignment::Center, scale);
+    let underline = (if scale == 2 {
+        width as u32
+    } else {
+        width as u32 / 2
+    })
+    .min(220);
+    cfill(d, 140 - underline as i32 / 2, 150, underline, 2, C_ACCENT);
+    if st.show_clock {
+        ctext8r(d, &st.time(), 256, 208, C_DIM);
+    }
+    if st.show_output && matches!(st.link, OutputState::Idle) {
+        ctext6(d, "no link", 24, 208, C_DIM);
+    }
+}
+
+/// 4. Tiles: four framed tiles (layer / WPM / link / batteries).
+fn render_concept_tiles<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptState) {
+    let _ = d.clear(C_BG);
+    let tiles = [(12, 10), (152, 10), (12, 124), (152, 124)];
+    for (x, y) in tiles {
+        cframe(d, x, y, 116, 104, C_PANEL, C_BORDER);
+    }
+
+    ctext6(d, "LAYER", 24, 20, C_DIM);
+    let (name, scale) = fit_name(st.name.as_str(), 92);
+    ctext20(d, &name, 24, scale_y(scale, 46), C_INK, Alignment::Left, scale);
+
+    if st.show_wpm {
+        ctext6(d, "WPM", 164, 20, C_DIM);
+        let mut wpm: heapless::String<8> = heapless::String::new();
+        let _ = write!(&mut wpm, "{}", st.wpm);
+        ctext20(d, &wpm, 248, 56, C_ACCENT, Alignment::Right, 2);
+    }
+
+    if st.show_output {
+        ctext6(d, "LINK", 24, 134, C_DIM);
+        let (badge, color) = st.badge();
+        if st.compact_output {
+            cfill(d, 26, 158, 4, 6, color);
+            ctext6(d, &badge, 34, 156, C_INK);
+        } else {
+            cfill(d, 26, 158, 8, 12, color);
+            ctext8(d, &badge, 42, 158, C_INK);
+        }
+        let mut profile: heapless::String<16> = heapless::String::new();
+        let _ = write!(&mut profile, "profile {}", st.link_profile);
+        ctext6(d, &profile, 26, 184, C_DIM);
+    }
+
+    if st.show_batteries {
+        ctext6(d, "BATTERY", 164, 134, C_DIM);
+        for index in 0..2 {
+            let (level, _) = st.bat(index);
+            let y = 158 + index as i32 * 28;
+            let side = st.side(index);
+            let value = concept_battery_text(st, index);
+            ctext6(d, &side, 164, y, C_DIM);
+            ctext6r(d, &value, 256, y, battery_color(level));
+            cbar(
+                d,
+                164,
+                y + 12,
+                92,
+                8,
+                level.unwrap_or(0) as u32,
+                battery_color(level),
+            );
+        }
+    }
+}
+
+// Layout of the speedometer: three columns with the media ticker under them.
+//
+//   LINK                 120                 LEFT
+//   [ USB ]     words per minute              73%      <- the value is
+//   wired        [20-segment 0..150]         RIGHT        FONT_10X20 ×2,
+//                                              41%        `%` included
+//   ──────────────────────────────────────────────────────
+//   Boards of Canada - Roygbiv (Live at Coachella 2006)…
+//
+// The ×2 value is wide: a full "100%" is 80 px, so the right column needs all of
+// its 82 px and the segmented scale stops at x = 180 instead of running under
+// the battery block (that would collide with the second row).
+
+const SPEEDO_LEFT: i32 = 16;
+const SPEEDO_RIGHT: i32 = 264;
+const SPEEDO_CENTRE: i32 = 140;
+const SPEEDO_TITLE_Y: i32 = 12;
+const SPEEDO_RULE_Y: i32 = 34;
+const SPEEDO_LINK_CAPTION_Y: i32 = 46;
+const SPEEDO_LINK_BADGE_Y: i32 = 62;
+const SPEEDO_LINK_STATE_Y: i32 = 88;
+const SPEEDO_WPM_Y: i32 = 52;
+const SPEEDO_WPM_CAPTION_Y: i32 = 98;
+const SPEEDO_SCALE_X: i32 = 40;
+const SPEEDO_SCALE_W: u32 = 140;
+const SPEEDO_SCALE_Y: i32 = 118;
+const SPEEDO_SCALE_H: u32 = 12;
+const SPEEDO_SCALE_LABEL_Y: i32 = 134;
+const SPEEDO_SCALE_MAX: u32 = 150;
+const SPEEDO_BAT_LABEL_Y: [i32; 2] = [44, 104];
+const SPEEDO_BAT_VALUE_Y: [i32; 2] = [56, 116];
+const SPEEDO_MEDIA_RULE_Y: i32 = 190;
+const SPEEDO_MEDIA_Y: i32 = 198;
+/// Ticker window in characters of `FONT_6X10` (280 − 2×20 = 240 px).
+const SPEEDO_MEDIA_CHARS: usize = 40;
+
+/// State word of the link column; the colour still comes from the badge.
+fn speedo_link_state(link: OutputState) -> &'static str {
+    match link {
+        OutputState::Usb => "wired",
+        OutputState::Ble { .. } => "connected",
+        OutputState::Pairing { .. } => "pairing",
+        OutputState::Reconnecting { .. } => "reconnecting",
+        OutputState::Idle => "idle",
+    }
+}
+
+/// Left column: connection type, its state and the badge, in the same colours
+/// the other screens use (`QSID 227 = Chip row` keeps the badge compact).
+fn speedo_link<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptState) {
+    ctext6(d, "LINK", SPEEDO_LEFT, SPEEDO_LINK_CAPTION_Y, C_DIM);
+    let (_, color) = st.badge();
+    badge_plate(d, SPEEDO_LEFT, SPEEDO_LINK_BADGE_Y, 44, 20, st);
+    ctext6(
+        d,
+        speedo_link_state(st.link),
+        SPEEDO_LEFT,
+        SPEEDO_LINK_STATE_Y,
+        color,
+    );
+}
+
+/// Right column, one half per row: compact label above the value, and the value
+/// in the largest font the panel has — `FONT_10X20` at ×2, `%` included.
+fn speedo_battery<D: DrawTarget<Color = Rgb565>>(d: &mut D, index: usize, st: &ConceptState) {
+    let slot = index.min(1);
+    let (level, connected) = st.bat(slot);
+    ctext6r(d, st.label(slot), SPEEDO_RIGHT, SPEEDO_BAT_LABEL_Y[slot], C_DIM);
+    let color = if connected { battery_color(level) } else { C_DIM };
+    let mut value: heapless::String<8> = heapless::String::new();
+    if !connected {
+        let _ = value.push_str("--");
+    } else if let Some(pct) = level {
+        let _ = write!(&mut value, "{}%", pct);
+    } else {
+        let _ = value.push_str("??");
+    }
+    ctext20(
+        d,
+        &value,
+        SPEEDO_RIGHT,
+        SPEEDO_BAT_VALUE_Y[slot],
+        color,
+        Alignment::Right,
+        2,
+    );
+}
+
+/// Bottom line: the media ticker (same window and step as the dashboard header),
+/// or the time when there is nothing to scroll — an empty strip would be dead
+/// space, and with no clock either the strip is not drawn at all.
+fn speedo_bottom<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptState) {
+    if st.show_media && !st.media.is_empty() {
+        cline(d, 20, SPEEDO_MEDIA_RULE_Y, 240, C_BORDER);
+        let mut line: heapless::String<48> = heapless::String::new();
+        if st.media.chars().count() <= SPEEDO_MEDIA_CHARS {
+            // A track that fits sits still and centred; only longer ones scroll.
+            let _ = line.push_str(st.media.as_str());
+            ctext6c(d, &line, SPEEDO_CENTRE, SPEEDO_MEDIA_Y, C_INK);
+        } else {
+            push_marquee_slice(
+                &mut line,
+                st.media.as_str(),
+                st.media_offset,
+                SPEEDO_MEDIA_CHARS,
+            );
+            ctext6(d, &line, 20, SPEEDO_MEDIA_Y, C_INK);
+        }
+        return;
+    }
+    if !st.show_clock {
+        return;
+    }
+    cline(d, 20, SPEEDO_MEDIA_RULE_Y, 240, C_BORDER);
+    ctext8(d, &st.time(), 20, SPEEDO_MEDIA_Y - 2, C_DIM);
+    let mut layer_no: heapless::String<8> = heapless::String::new();
+    let _ = write!(&mut layer_no, "L{}", st.layer);
+    ctext6r(d, &layer_no, 260, SPEEDO_MEDIA_Y + 2, C_DIM);
+}
+
+/// 5. Speedometer: link on the left, the WPM number (and its scale) in the
+/// centre, the battery percentages in the largest font on the right and the
+/// media ticker across the bottom.
+fn render_concept_speedo<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptState) {
+    let _ = d.clear(C_BG);
+
+    let (name, scale) = fit_name(st.name.as_str(), 200);
+    ctext20(
+        d,
+        &name,
+        SPEEDO_CENTRE,
+        SPEEDO_TITLE_Y,
+        C_DIM,
+        Alignment::Center,
+        scale.min(1),
+    );
+    cline(d, 20, SPEEDO_RULE_Y, 240, C_BORDER);
+
+    if st.show_wpm {
+        let mut wpm: heapless::String<8> = heapless::String::new();
+        let _ = write!(&mut wpm, "{}", st.wpm);
+        ctext20(
+            d,
+            &wpm,
+            SPEEDO_CENTRE,
+            SPEEDO_WPM_Y,
+            C_ACCENT,
+            Alignment::Center,
+            2,
+        );
+        ctext6c(
+            d,
+            "words per minute",
+            SPEEDO_CENTRE,
+            SPEEDO_WPM_CAPTION_Y,
+            C_DIM,
+        );
+
+        const SEGMENTS: u32 = 20;
+        let filled =
+            (st.wpm.min(SPEEDO_SCALE_MAX as u16) as u32 * SEGMENTS / SPEEDO_SCALE_MAX).min(SEGMENTS);
+        let pitch = SPEEDO_SCALE_W / SEGMENTS;
+        for segment in 0..SEGMENTS {
+            let x = SPEEDO_SCALE_X + segment as i32 * pitch as i32;
+            let color = if segment < filled {
+                if segment * 100 / SEGMENTS < 60 {
+                    C_OK
+                } else if segment * 100 / SEGMENTS < 85 {
+                    C_WARN
+                } else {
+                    C_BAD
+                }
+            } else {
+                C_PANEL_HI
+            };
+            cfill(
+                d,
+                x,
+                SPEEDO_SCALE_Y,
+                pitch.saturating_sub(1),
+                SPEEDO_SCALE_H,
+                color,
+            );
+        }
+        ctext6(d, "0", SPEEDO_SCALE_X, SPEEDO_SCALE_LABEL_Y, C_DIM);
+        ctext6r(
+            d,
+            "150",
+            SPEEDO_SCALE_X + SPEEDO_SCALE_W as i32,
+            SPEEDO_SCALE_LABEL_Y,
+            C_DIM,
+        );
+    }
+
+    if st.show_output {
+        speedo_link(d, st);
+    }
+    if st.show_batteries {
+        for index in 0..2 {
+            speedo_battery(d, index, st);
+        }
+    }
+
+    speedo_bottom(d, st);
+}
+
+/// 6. Info centre: big clock, date, media ticker, one status line.
+fn render_concept_infocenter<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptState) {
+    let _ = d.clear(C_BG);
+    if st.show_clock {
+        ctext20(d, &st.time(), 140, 24, C_INK, Alignment::Center, 2);
+    }
+    // The date strip stays empty until the host sends a date: the pinned RMK
+    // host protocol (`rmk::host_data::HostData`) carries hour/minute only.
+    if let Some(date) = st.date {
+        ctext6c(d, date, 140, 74, C_ACCENT);
+    }
+    cline(d, 30, 90, 220, C_BORDER);
+
+    if st.show_media {
+        let mut media: heapless::String<36> = heapless::String::new();
+        if st.media.is_empty() {
+            let _ = media.push_str("-- nothing playing --");
+        } else {
+            media = clipped::<36>(st.media.as_str(), 31);
+        }
+        ctext6c(d, "NOW PLAYING", 140, 104, C_DIM);
+        ctext8c(d, &media, 140, 118, C_INK);
+    }
+
+    cline(d, 30, 146, 220, C_BORDER);
+    let (name, _) = fit_name(st.name.as_str(), 110);
+    ctext6(d, "layer", 30, 158, C_DIM);
+    ctext6(d, &name, 30, 172, C_INK);
+    if st.show_wpm {
+        let mut wpm: heapless::String<8> = heapless::String::new();
+        let _ = write!(&mut wpm, "{}", st.wpm);
+        ctext6(d, "wpm", 150, 158, C_DIM);
+        ctext6(d, &wpm, 150, 172, C_ACCENT);
+    }
+    if st.show_batteries {
+        ctext6(d, "bat", 205, 158, C_DIM);
+        bat_line(d, 205, 172, st);
+    }
+    if st.show_output {
+        badge_line(d, 30, 200, st);
+    }
+    let mut layer_no: heapless::String<8> = heapless::String::new();
+    let _ = write!(&mut layer_no, "L{}", st.layer);
+    ctext6r(d, &layer_no, 260, 200, C_DIM);
+}
+
+/// 7. Two columns with a divider: keyboard state | link state.
+fn render_concept_twocol<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptState) {
+    let _ = d.clear(C_BG);
+    cfill(d, 139, 16, 2, 208, C_BORDER);
+    ctext6(d, "KEYBOARD", 20, 18, C_DIM);
+    ctext6(d, "CONNECTION", 158, 18, C_DIM);
+
+    let (name, scale) = fit_name(st.name.as_str(), 110);
+    ctext20(d, &name, 20, scale_y(scale, 46), C_INK, Alignment::Left, scale);
+    let mut layer_no: heapless::String<16> = heapless::String::new();
+    let _ = write!(&mut layer_no, "layer {}", st.layer);
+    ctext6(d, &layer_no, 20, 100, C_DIM);
+
+    if st.show_wpm {
+        let mut wpm: heapless::String<8> = heapless::String::new();
+        let _ = write!(&mut wpm, "{}", st.wpm);
+        ctext20(d, &wpm, 20, 122, C_ACCENT, Alignment::Left, 2);
+        ctext6(d, "wpm", 130, 150, C_DIM);
+    }
+    if st.show_modifiers {
+        cmods(d, 20, 176, st);
+    }
+
+    if st.show_output {
+        let (badge, color) = st.badge();
+        if st.compact_output {
+            cfill(d, 160, 46, 4, 6, color);
+            ctext6(d, &badge, 168, 44, C_INK);
+        } else {
+            cfill(d, 160, 44, 10, 14, color);
+            ctext8(d, &badge, 178, 44, C_INK);
+        }
+        ctext6(d, link_words(st.link), 158, 68, C_DIM);
+        let mut profile: heapless::String<16> = heapless::String::new();
+        let _ = write!(&mut profile, "profile {}", st.link_profile);
+        ctext6(d, &profile, 158, 84, C_DIM);
+    }
+
+    if st.show_batteries {
+        for index in 0..2 {
+            let (level, _) = st.bat(index);
+            let y = 120 + index as i32 * 46;
+            let value = concept_battery_text(st, index);
+            ctext6(d, st.label(index), 158, y, C_DIM);
+            ctext6r(d, &value, 260, y, battery_color(level));
+            cbar(
+                d,
+                158,
+                y + 14,
+                102,
+                10,
+                level.unwrap_or(0) as u32,
+                battery_color(level),
+            );
+        }
+    }
+    if st.show_clock {
+        ctext8(d, &st.time(), 158, 204, C_DIM);
+    }
+}
+
+/// 8. Sparkline: WPM history as bars.
+fn render_concept_sparkline<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptState) {
+    let _ = d.clear(C_BG);
+    let (name, scale) = fit_name(st.name.as_str(), 140);
+    ctext20(d, &name, 20, 12, C_INK, Alignment::Left, scale.min(1));
+
+    if st.show_wpm {
+        let mut wpm: heapless::String<8> = heapless::String::new();
+        let _ = write!(&mut wpm, "{}", st.wpm);
+        ctext20(d, &wpm, 260, 12, C_ACCENT, Alignment::Right, 1);
+        ctext6(d, "wpm history", 20, 42, C_DIM);
+        cline(d, 20, 56, 240, C_BORDER);
+
+        let bars = st.wpm_history.len().min(WPM_HISTORY_LEN).max(1);
+        let max = st
+            .wpm_history
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0)
+            .max(1) as u32;
+        let bar_w = (236 / bars as u32).max(4);
+        for index in 0..bars {
+            let value = st.wpm_history.get(index).copied().unwrap_or(0) as u32;
+            let height = (value * 120 / max).max(if value > 0 { 3 } else { 1 });
+            let x = 20 + index as i32 * (bar_w as i32 + 1);
+            let y = 190 - height as i32;
+            let color = if index + 1 == bars {
+                C_ACCENT
+            } else if value * 100 / max > 80 {
+                C_WARN
+            } else {
+                C_PANEL_HI
+            };
+            cfill(d, x, y, bar_w, height, color);
+        }
+        cline(d, 20, 190, 240, C_BORDER);
+        ctext6(d, "0", 20, 196, C_DIM);
+        let mut peak: heapless::String<16> = heapless::String::new();
+        let _ = write!(&mut peak, "peak {}", max);
+        ctext6r(d, &peak, 260, 196, C_DIM);
+    }
+
+    if st.show_output {
+        badge_line(d, 20, 214, st);
+    }
+    if st.show_batteries {
+        bat_line(d, 150, 214, st);
+    }
+}
+
+/// One `key: value` line of the terminal concept.
+fn cterm_row<D: DrawTarget<Color = Rgb565>>(d: &mut D, y: i32, key: &str, value: &str) {
+    ctext6(d, key, 14, y, C_DIM);
+    ctext6(d, ":", 62, y, C_DIM);
+    ctext6(d, value, 74, y, C_TERM);
+}
+
+/// 2. Terminal: black background, green mono text, ASCII frame.
+fn render_concept_terminal<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptState) {
+    let _ = d.clear(C_BLACK);
+    cbox(d, 6, 6, 268, 228, C_TERM);
+    cfill(d, 7, 7, 266, 14, C_TERM);
+    ctext6(d, "QUBE // status", 12, 9, C_BLACK);
+    ctext6r(
+        d,
+        if st.sleeping { "sleeping" } else { "awake" },
+        268,
+        9,
+        C_BLACK,
+    );
+
+    let mut row = 0i32;
+    // Where the blinking cursor block goes: right after the last printed row.
+    let mut cursor = (80i32, 30i32);
+    let mut place = |value: &str| {
+        let y = 30 + row * 22;
+        cursor = (74 + 6 * value.chars().count() as i32 + 6, y);
+        row += 1;
+        y
+    };
+
+    let mut layer_value: heapless::String<24> = heapless::String::new();
+    let _ = write!(
+        &mut layer_value,
+        "{} ({})",
+        st.layer,
+        clipped::<16>(st.name.as_str(), 12)
+    );
+    let y = place(&layer_value);
+    cterm_row(d, y, "layer", &layer_value);
+
+    if st.show_wpm {
+        let mut value: heapless::String<8> = heapless::String::new();
+        let _ = write!(&mut value, "{}", st.wpm);
+        let y = place(&value);
+        cterm_row(d, y, "wpm", &value);
+    }
+    if st.show_output {
+        let (badge, _) = st.badge();
+        let mut value: heapless::String<24> = heapless::String::new();
+        let _ = write!(&mut value, "{} [{}]", badge, link_words(st.link));
+        let y = place(&value);
+        cterm_row(d, y, "link", &value);
+
+        let mut value: heapless::String<8> = heapless::String::new();
+        let _ = write!(&mut value, "{}", st.link_profile);
+        let y = place(&value);
+        cterm_row(d, y, "profile", &value);
+    }
+    if st.show_batteries {
+        let left = concept_battery_text(st, 0);
+        let right = concept_battery_text(st, 1);
+        let mut value: heapless::String<24> = heapless::String::new();
+        let _ = write!(
+            &mut value,
+            "{} {} / {} {}",
+            st.side(0),
+            left,
+            st.side(1),
+            right
+        );
+        let y = place(&value);
+        cterm_row(d, y, "bat", &value);
+    }
+    if st.show_modifiers {
+        let mut value: heapless::String<24> = heapless::String::new();
+        if st.mods & 0x03 != 0 {
+            let _ = value.push_str("ctrl ");
+        }
+        if st.mods & 0x0C != 0 {
+            let _ = value.push_str("shift ");
+        }
+        if st.mods & 0x30 != 0 {
+            let _ = value.push_str("alt ");
+        }
+        if st.mods & 0xC0 != 0 {
+            let _ = value.push_str("gui ");
+        }
+        if st.caps_lock {
+            let _ = value.push_str("caps ");
+        }
+        if st.num_lock {
+            let _ = value.push_str("num ");
+        }
+        if value.is_empty() {
+            let _ = value.push_str("none");
+        }
+        let trimmed = value.trim_end();
+        let mut text: heapless::String<24> = heapless::String::new();
+        let _ = text.push_str(trimmed);
+        let y = place(&text);
+        cterm_row(d, y, "mods", &text);
+    }
+    if st.show_media {
+        let text = clipped::<30>(st.media.as_str(), 26);
+        let y = place(&text);
+        cterm_row(d, y, "media", &text);
+    }
+    if st.show_clock {
+        let text = st.time();
+        let y = place(&text);
+        cterm_row(d, y, "clock", &text);
+    }
+
+    // Blinking-cursor block, the classic touch.
+    cfill(d, cursor.0, cursor.1, 8, 10, C_TERM);
+}
+
+/// 1. HUD: progress bars, loud modifier chips, big link badge.
+fn render_concept_hud<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptState) {
+    let _ = d.clear(C_BG);
+    let (name, scale) = fit_name(st.name.as_str(), 150);
+    ctext20(d, &name, 16, 10, C_INK, Alignment::Left, scale.min(1));
+    if st.show_clock {
+        ctext6r(d, &st.time(), 264, 16, C_DIM);
+    }
+    cline(d, 16, 40, 248, C_BORDER);
+
+    if st.show_wpm {
+        ctext6(d, "WPM", 16, 50, C_DIM);
+        let mut value: heapless::String<16> = heapless::String::new();
+        let _ = write!(&mut value, "{} / 150", st.wpm);
+        ctext6r(d, &value, 264, 50, C_ACCENT);
+        cbar(d, 16, 64, 248, 16, st.wpm.min(150) as u32 * 100 / 150, C_ACCENT);
+    }
+
+    if st.show_batteries {
+        for index in 0..2 {
+            let (level, connected) = st.bat(index);
+            let y = 92 + index as i32 * 30;
+            ctext6(d, st.label(index), 16, y, C_DIM);
+            ctext6r(d, &concept_battery_text(st, index), 264, y, battery_color(level));
+            cbar(
+                d,
+                16,
+                y + 12,
+                248,
+                12,
+                if connected {
+                    level.unwrap_or(0) as u32
+                } else {
+                    0
+                },
+                battery_color(level),
+            );
+        }
+    }
+
+    if st.show_modifiers {
+        ctext6(d, "MODS", 16, 152, C_DIM);
+        let chips = [
+            ("CTRL", st.mods & 0x03 != 0),
+            ("SHIFT", st.mods & 0x0C != 0),
+            ("ALT", st.mods & 0x30 != 0),
+            ("GUI", st.mods & 0xC0 != 0),
+            ("CAPS", st.caps_lock),
+        ];
+        for (index, (label, active)) in chips.iter().enumerate() {
+            let x = 16 + index as i32 * 50;
+            let (fill, text) = if *active {
+                (C_ACCENT_DIM, C_INK)
+            } else {
+                (C_PANEL, C_DIM)
+            };
+            cfill(d, x, 166, 44, 18, fill);
+            cbox(d, x, 166, 44, 18, if *active { C_ACCENT } else { C_BORDER });
+            ctext6c(d, label, x + 22, 170, text);
+        }
+    }
+
+    if st.show_output {
+        ctext6(d, "LINK", 16, 194, C_DIM);
+        // Loud badge: a filled pill with dark text inside, not a bare square.
+        badge_plate(d, 16, 206, 74, 24, st);
+        ctext6r(d, link_words(st.link), 264, 214, C_DIM);
+    }
+}
+
+/// 9. Signal: link as a radio panel (signal bars, profile dots, USB plug).
+fn render_concept_signal<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptState) {
+    let _ = d.clear(C_BG);
+    ctext6(d, "LINK", 20, 16, C_DIM);
+    let (name, scale) = fit_name(st.name.as_str(), 160);
+    ctext20(d, &name, 260, 14, C_INK, Alignment::Right, scale.min(1));
+
+    let (badge, badge_color) = st.badge();
+
+    if st.show_output {
+        ctext20(d, &badge, 20, 40, badge_color, Alignment::Left, 2);
+        ctext6(d, link_words(st.link), 20, 88, C_DIM);
+
+        // Signal bars: filled when a BLE profile is up, empty when idle/pairing.
+        let strength = match st.link {
+            OutputState::Ble { .. } => 4,
+            OutputState::Pairing { .. } | OutputState::Reconnecting { .. } => 2,
+            OutputState::Usb | OutputState::Idle => 0,
+        };
+        for bar in 0..4 {
+            let height = 12 + bar as u32 * 10;
+            let x = 190 + bar as i32 * 20;
+            let y = 136 - height as i32;
+            let color = if bar < strength { C_OK } else { C_PANEL_HI };
+            cfill(d, x, y, 12, height, color);
+        }
+
+        ctext6(d, "PROFILE", 20, 128, C_DIM);
+        for profile in 0..5u8 {
+            let active = profile == st.link_profile && !matches!(st.link, OutputState::Usb);
+            let x = 20 + profile as i32 * 30;
+            cfill(
+                d,
+                x,
+                142,
+                22,
+                22,
+                if active { badge_color } else { C_PANEL },
+            );
+            cbox(d, x, 142, 22, 22, if active { C_INK } else { C_BORDER });
+            let mut text: heapless::String<2> = heapless::String::new();
+            let _ = write!(&mut text, "{}", profile);
+            ctext6c(d, &text, x + 11, 148, if active { C_BLACK } else { C_DIM });
+        }
+
+        // USB plug drawn from three rectangles.
+        let usb_active = matches!(st.link, OutputState::Usb);
+        let usb_color = if usb_active { C_OK } else { C_PANEL_HI };
+        cfill(d, 20, 186, 16, 12, usb_color);
+        cfill(d, 38, 189, 8, 6, usb_color);
+        cfill(d, 48, 186, 4, 12, usb_color);
+        ctext6(d, "USB", 60, 188, if usb_active { C_INK } else { C_DIM });
+    }
+
+    if st.show_batteries {
+        ctext6(d, "BATTERY", 150, 186, C_DIM);
+        for index in 0..2 {
+            let (level, _) = st.bat(index);
+            let x = 150 + index as i32 * 58;
+            let side = st.side(index);
+            ctext6(d, &side, x, 200, C_DIM);
+            cbar(
+                d,
+                x + 12,
+                198,
+                40,
+                12,
+                level.unwrap_or(0) as u32,
+                battery_color(level),
+            );
+        }
+    }
+}
+
+/// 10. Mood: an ASCII creature that reacts to the state (text-only "pet").
+fn render_concept_mood<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptState) {
+    let _ = d.clear(C_BG);
+    let (face, mood) = if st.sleeping {
+        ("(-_-) zZ", "sleeping")
+    } else if matches!(st.link, OutputState::Idle) {
+        ("(o_o) ?", "no host")
+    } else if st.wpm > 90 {
+        ("(>_<)", "flying")
+    } else if st.wpm > 40 {
+        ("(^_^)", "typing")
+    } else {
+        ("( ._. )", "idle")
+    };
+
+    ctext20(d, face, 140, 40, C_ACCENT, Alignment::Center, 2);
+    ctext6c(d, mood, 140, 96, C_DIM);
+    cline(d, 40, 116, 200, C_BORDER);
+
+    let (name, scale) = fit_name(st.name.as_str(), 200);
+    ctext20(d, &name, 140, 128, C_INK, Alignment::Center, scale.min(1));
+
+    if st.show_wpm {
+        let mut wpm: heapless::String<16> = heapless::String::new();
+        let _ = write!(&mut wpm, "{} wpm", st.wpm);
+        ctext6c(d, &wpm, 140, 168, C_ACCENT);
+    }
+    if st.show_modifiers {
+        cmods(d, 100, 186, st);
+    }
+    if st.show_output {
+        badge_line(d, 40, 208, st);
+    }
+    if st.show_clock {
+        ctext6r(d, &st.time(), 240, 210, C_DIM);
+    }
+}
+
+// --- round two: battery tiles, media centre, board --------------------------
+//
+// Ported from the second preview round (`work/qube-preview/src/concepts2.rs`).
+// The stand passed a palette struct around; here the same roles are drawn with
+// the factory constants and the panel post-pass (`look_pixel`) turns them into
+// the configured colours, which is what makes the light theme work on these
+// screens too. The only deliberate difference from the mocks: the host protocol
+// carries no track position, so the progress bars are not drawn at all.
+
+/// Battery colour of the second round: "good" is the bar/scale colour.
+fn pbat_color(level: Option<u8>) -> Rgb565 {
+    match level {
+        Some(value) if value < 10 => C_BAD,
+        Some(value) if value < 25 => C_WARN,
+        Some(_) => COL_BAR_FG,
+        None => C_DIM,
+    }
+}
+
+/// Badge of the second round: a taller dot than [`badge_line`].
+fn pbadge<D: DrawTarget<Color = Rgb565>>(d: &mut D, x: i32, y: i32, st: &ConceptState) {
+    let (text, color) = st.badge();
+    cfill(d, x, y + 2, 4, 8, color);
+    ctext6(d, &text, x + 8, y, C_INK);
+}
+
+/// `L 73%  R 41%` with the second round's spacing.
+fn pbat_line<D: DrawTarget<Color = Rgb565>>(d: &mut D, x: i32, y: i32, st: &ConceptState) {
+    for index in 0..2 {
+        let (level, connected) = st.bat(index);
+        let side = st.side(index);
+        let mut value: heapless::String<8> = heapless::String::new();
+        if !connected {
+            let _ = value.push_str("--");
+        } else if let Some(pct) = level {
+            let _ = write!(&mut value, "{}%", pct);
+        } else {
+            let _ = value.push_str("??");
+        }
+        ctext6(d, &side, x + index as i32 * 40, y, C_DIM);
+        ctext6(d, &value, x + 9 + index as i32 * 40, y, pbat_color(level));
+    }
+}
+
+/// `ctrl shift …` (or `none`) in one line of `FONT_6X10`.
+fn concept_mods_text(st: &ConceptState) -> heapless::String<24> {
+    let mut out: heapless::String<24> = heapless::String::new();
+    if st.mods & 0x03 != 0 {
+        let _ = out.push_str("ctrl ");
+    }
+    if st.mods & 0x0C != 0 {
+        let _ = out.push_str("shift ");
+    }
+    if st.mods & 0x30 != 0 {
+        let _ = out.push_str("alt ");
+    }
+    if st.mods & 0xC0 != 0 {
+        let _ = out.push_str("gui ");
+    }
+    if st.caps_lock {
+        let _ = out.push_str("caps ");
+    }
+    if st.num_lock {
+        let _ = out.push_str("num ");
+    }
+    if out.is_empty() {
+        let _ = out.push_str("none");
+    } else {
+        let len = out.trim_end().len();
+        out.truncate(len);
+    }
+    out
+}
+
+/// `"artist - title"` → `(artist, title)`; the separator is what the dashboard
+/// uses when it builds the line.
+fn media_split(media: &str) -> (&str, &str) {
+    match media.find(" - ") {
+        Some(index) => (&media[..index], &media[index + 3..]),
+        None => ("", media),
+    }
+}
+
+/// 11. Battery tiles: the charge of both halves in two big tiles.
+fn render_concept_battiles<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptState) {
+    let _ = d.clear(C_BG);
+    let (name, _) = fit_name(st.name.as_str(), 120);
+    ctext6(d, &name, 16, 14, C_INK);
+    if st.show_wpm {
+        let mut wpm: heapless::String<16> = heapless::String::new();
+        let _ = write!(&mut wpm, "{} wpm", st.wpm);
+        ctext6c(d, &wpm, 140, 14, C_ACCENT);
+    }
+    if st.show_output {
+        pbadge(d, 226, 14, st);
+    }
+
+    for index in 0..2 {
+        let x = if index == 0 { 16 } else { 148 };
+        cframe(d, x, 40, 116, 128, C_PANEL, C_BORDER);
+        ctext6(d, st.label(index), x + 10, 50, C_DIM);
+        let (level, connected) = st.bat(index);
+        let mut value: heapless::String<16> = heapless::String::new();
+        if !connected {
+            let _ = value.push_str("--");
+        } else if let Some(pct) = level {
+            let _ = write!(&mut value, "{}%", pct);
+        } else {
+            let _ = value.push_str("??");
+        }
+        if st.show_batteries {
+            // ×2: even "100%" is 80 px inside a 116 px tile.
+            ctext20(
+                d,
+                &value,
+                x + 58,
+                70,
+                pbat_color(level),
+                Alignment::Center,
+                2,
+            );
+            cbar(
+                d,
+                x + 12,
+                132,
+                92,
+                16,
+                if connected { level.unwrap_or(0) as u32 } else { 0 },
+                pbat_color(level),
+            );
+            ctext6(
+                d,
+                if connected { "connected" } else { "no link" },
+                x + 12,
+                152,
+                C_DIM,
+            );
+        }
+    }
+
+    cfill(d, 16, 176, 248, 2, C_BORDER);
+    if st.show_modifiers {
+        cmods(d, 16, 186, st);
+        ctext6(d, &concept_mods_text(st), 16, 206, C_DIM);
+    }
+    if st.show_clock {
+        ctext6r(d, &st.time(), 264, 186, C_DIM);
+    }
+    if st.show_output {
+        ctext6r(d, link_words(st.link), 264, 206, C_ACCENT);
+    }
+}
+
+/// 12. Media centre: the track title large, with the state in the footer.
+fn render_concept_mediacenter<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptState) {
+    let _ = d.clear(C_BG);
+    ctext6(d, "NOW PLAYING", 20, 18, C_DIM);
+    cfill(d, 20, 32, 40, 2, C_ACCENT);
+
+    let (artist, title) = media_split(st.media.as_str());
+    let mut line: heapless::String<40> = heapless::String::new();
+    if !st.show_media {
+        // Media hidden by the header setting: the centre carries the clock.
+        if st.show_clock {
+            ctext20(
+                d,
+                &st.time(),
+                140,
+                60,
+                C_INK,
+                Alignment::Center,
+                2,
+            );
+        }
+    } else {
+        if st.media.is_empty() {
+            let _ = line.push_str("nothing playing");
+        } else {
+            let _ = line.push_str(title);
+        }
+        let (fitted, scale) = fit_name(&line, 240);
+        ctext20(
+            d,
+            &fitted,
+            140,
+            scale_y(scale, 54),
+            C_INK,
+            Alignment::Center,
+            scale,
+        );
+        if !artist.is_empty() && artist != title {
+            ctext8c(d, &clipped::<36>(artist, 30), 140, 116, C_DIM);
+        }
+    }
+
+    // No progress bar: the host protocol carries no track position
+    // (`rmk::host_data::HostData` has hour/minute and the media text only).
+    if st.show_clock && st.show_media {
+        ctext6(d, &st.time(), 20, 160, C_DIM);
+    }
+
+    cfill(d, 20, 188, 240, 2, C_BORDER);
+    let (name, _) = fit_name(st.name.as_str(), 120);
+    ctext6(d, &name, 20, 198, C_INK);
+    if st.show_wpm {
+        let mut wpm: heapless::String<16> = heapless::String::new();
+        let _ = write!(&mut wpm, "{} wpm", st.wpm);
+        ctext6(d, &wpm, 150, 198, C_ACCENT);
+    }
+    if st.show_output {
+        pbadge(d, 20, 216, st);
+    }
+    if st.show_batteries {
+        pbat_line(d, 150, 216, st);
+    }
+}
+
+/// 13. Board: the two halves as tiles on top, the "phone" with the track below.
+fn render_concept_board<D: DrawTarget<Color = Rgb565>>(d: &mut D, st: &ConceptState) {
+    let _ = d.clear(C_BG);
+    for index in 0..2 {
+        let x = if index == 0 { 16 } else { 148 };
+        cframe(d, x, 12, 116, 68, C_PANEL, C_BORDER);
+        ctext6(
+            d,
+            if index == 0 { "LEFT" } else { "RIGHT" },
+            x + 10,
+            20,
+            C_DIM,
+        );
+        let (level, connected) = st.bat(index);
+        let mut value: heapless::String<16> = heapless::String::new();
+        if !connected {
+            let _ = value.push_str("--");
+        } else if let Some(pct) = level {
+            let _ = write!(&mut value, "{}%", pct);
+        } else {
+            let _ = value.push_str("??");
+        }
+        if st.show_batteries {
+            ctext20(
+                d,
+                &value,
+                x + 58,
+                36,
+                pbat_color(level),
+                Alignment::Center,
+                1,
+            );
+            cbar(
+                d,
+                x + 10,
+                62,
+                96,
+                10,
+                if connected { level.unwrap_or(0) as u32 } else { 0 },
+                pbat_color(level),
+            );
+        }
+    }
+    cfill(d, 132, 40, 16, 4, C_BORDER);
+    cfill(d, 132, 52, 16, 4, C_BORDER);
+
+    let mut layer_no: heapless::String<8> = heapless::String::new();
+    let _ = write!(&mut layer_no, "L{}", st.layer);
+    ctext6(d, &layer_no, 16, 90, C_DIM);
+    let (name, _) = fit_name(st.name.as_str(), 140);
+    ctext6(d, &name, 44, 90, C_INK);
+    if st.show_wpm {
+        let mut wpm: heapless::String<16> = heapless::String::new();
+        let _ = write!(&mut wpm, "{} wpm", st.wpm);
+        ctext6r(d, &wpm, 264, 90, C_ACCENT);
+    }
+    if st.show_output {
+        pbadge(d, 16, 106, st);
+        ctext6r(d, link_words(st.link), 264, 106, C_DIM);
+    }
+    if st.show_modifiers {
+        cmods(d, 110, 106, st);
+    }
+
+    cframe(d, 24, 130, 232, 96, C_PANEL, C_BORDER);
+    ctext6(d, "PHONE / NOW PLAYING", 34, 138, C_DIM);
+    let (artist, title) = media_split(st.media.as_str());
+    if st.show_media {
+        let mut line: heapless::String<40> = heapless::String::new();
+        if st.media.is_empty() {
+            // The mock leaves the phone panel title empty when nothing plays.
+        } else {
+            let _ = line.push_str(title);
+        }
+        let (fitted, scale) = fit_name(&line, 200);
+        ctext20(
+            d,
+            &fitted,
+            140,
+            scale_y(scale, 154),
+            C_INK,
+            Alignment::Center,
+            scale,
+        );
+        // No progress bar: the host sends no track position. The line under the
+        // title carries the artist (left) and the clock (right) instead.
+        if !artist.is_empty() {
+            ctext6(d, &clipped::<36>(artist, 26), 36, 210, C_DIM);
+        }
+        if st.show_clock {
+            ctext6r(d, &st.time(), 244, 210, C_DIM);
+        }
+    } else if st.show_clock {
+        ctext20(
+            d,
+            &st.time(),
+            140,
+            160,
+            C_INK,
+            Alignment::Center,
+            2,
+        );
+    }
 }

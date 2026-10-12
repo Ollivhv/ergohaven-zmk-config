@@ -1,0 +1,28 @@
+diff --git "a/C:\\Users\\Ilya\\AppData\\Local\\Temp\\vial_orig.rs" "b/C:\\Users\\Ilya\\Documents\\Codex\\2026-10-06\\g\\work\\my-config\\rmk-qube\\vial.rs"
+index 5852c43..3a20b7c 100644
+--- "a/C:\\Users\\Ilya\\AppData\\Local\\Temp\\vial_orig.rs"
++++ "b/C:\\Users\\Ilya\\Documents\\Codex\\2026-10-06\\g\\work\\my-config\\rmk-qube\\vial.rs"
+@@ -91,10 +91,21 @@ pub(crate) async fn process_vial<'a>(
+         VialCommand::UnlockPoll => {
+             #[cfg(feature = "vial_lock")]
+             {
+-                locker.unlocking();
++                // Re-arm the physical hold window only while the keyboard is still locked.
++                // Calling `unlocking()` unconditionally made every UNLOCK_POLL reply carry
++                // `unlock_in_progress = 1`, even after the hold had already succeeded.
++                if !locker.is_unlocked() {
++                    locker.unlocking();
++                }
++                // Sample the state *after* the key check so a successful hold is reported
++                // as (unlocked = 1, in_progress = 0, counter = 0) — matching the reference
++                // Vial firmware (vial-qmk quantum/vial.c, case vial_unlock_poll). Clients
++                // that finish on `unlocked && !in_progress` (e.g. Entropy 0.4.0) otherwise
++                // wait forever while the progress bar already shows 100%.
++                let counter = locker.check_unlock();
+                 report.input_data[0] = locker.is_unlocked() as u8;
+                 report.input_data[1] = locker.is_unlocking() as u8;
+-                report.input_data[2] = locker.check_unlock();
++                report.input_data[2] = counter;
+             }
+             #[cfg(not(feature = "vial_lock"))]
+             error!("Vial lock feature is not enabled");
